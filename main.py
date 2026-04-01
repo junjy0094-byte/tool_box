@@ -6,8 +6,26 @@
   2. 아래 TOOLS 리스트에 해당 클래스를 추가한다.
 """
 
+import ctypes
+import platform
+import sys
 import tkinter as tk
 from tkinter import ttk
+
+
+def _enable_dpi_awareness() -> None:
+    """DPI 인식을 프로그램 시작 시 활성화하여 해상도 불일치를 방지합니다."""
+    if platform.system() == "Windows":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-Monitor DPI Aware
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
+_enable_dpi_awareness()
 
 # ── 등록할 도구 목록 ─────────────────────────────
 from tools.screenshot_tool import ScreenshotTool

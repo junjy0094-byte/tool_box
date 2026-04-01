@@ -13,6 +13,13 @@ from tools.base_tool import BaseTool
 TOOL_NAME = "screenshot"
 
 
+def _get_full_screen_bbox() -> tuple[int, int, int, int]:
+    """mss를 통해 전체 가상 화면의 (left, top, width, height)를 반환합니다."""
+    with mss.mss() as sct:
+        m = sct.monitors[0]  # 전체 가상 화면 (모든 모니터 합산)
+        return m["left"], m["top"], m["width"], m["height"]
+
+
 class RegionSelector(tk.Toplevel):
     """전체 화면 오버레이 위에서 드래그하여 영역을 선택합니다."""
 
@@ -22,11 +29,13 @@ class RegionSelector(tk.Toplevel):
         self.start_x = self.start_y = 0
         self.rect_id = None
 
-        # 화면 전체 크기를 명시적으로 가져와 geometry 설정
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
+        # mss에서 실제 물리 해상도를 가져와 오버레이 크기 설정
+        scr_left, scr_top, scr_w, scr_h = _get_full_screen_bbox()
+        self.scr_offset_x = scr_left
+        self.scr_offset_y = scr_top
+
         self.overrideredirect(True)
-        self.geometry(f"{screen_w}x{screen_h}+0+0")
+        self.geometry(f"{scr_w}x{scr_h}+{scr_left}+{scr_top}")
         self.attributes("-alpha", 0.3)
         self.configure(bg="black")
         self.lift()
@@ -34,7 +43,7 @@ class RegionSelector(tk.Toplevel):
 
         self.canvas = tk.Canvas(
             self, cursor="cross", bg="black", highlightthickness=0,
-            width=screen_w, height=screen_h,
+            width=scr_w, height=scr_h,
         )
         self.canvas.pack(fill="both", expand=True)
 
@@ -56,10 +65,10 @@ class RegionSelector(tk.Toplevel):
             self.canvas.coords(self.rect_id, self.start_x, self.start_y, event.x, event.y)
 
     def _on_release(self, event):
-        x1 = min(self.start_x, event.x)
-        y1 = min(self.start_y, event.y)
-        x2 = max(self.start_x, event.x)
-        y2 = max(self.start_y, event.y)
+        x1 = min(self.start_x, event.x) + self.scr_offset_x
+        y1 = min(self.start_y, event.y) + self.scr_offset_y
+        x2 = max(self.start_x, event.x) + self.scr_offset_x
+        y2 = max(self.start_y, event.y) + self.scr_offset_y
         self.destroy()
         if x2 - x1 > 5 and y2 - y1 > 5:
             self.callback((x1, y1, x2, y2))
