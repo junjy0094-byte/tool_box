@@ -1,4 +1,3 @@
-import ctypes
 import io
 import platform
 import subprocess
@@ -75,65 +74,52 @@ class RegionSelector(tk.Toplevel):
             self.callback((x1, y1, x2, y2))
 
 
-def _get_screen_dpi() -> float:
-    """시스템 화면 DPI를 반환합니다."""
-    if platform.system() == "Windows":
-        try:
-            hdc = ctypes.windll.user32.GetDC(0)
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
-            ctypes.windll.user32.ReleaseDC(0, hdc)
-            return float(dpi)
-        except Exception:
-            pass
-    return 96.0
-
-
 def _capture_region(bbox: tuple[int, int, int, int]) -> Image.Image:
     """mss를 사용하여 화면 영역을 캡처합니다."""
     x1, y1, x2, y2 = bbox
     with mss.mss() as sct:
         monitor = {"left": x1, "top": y1, "width": x2 - x1, "height": y2 - y1}
         shot = sct.grab(monitor)
-        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-        dpi = _get_screen_dpi()
-        img.info["dpi"] = (dpi, dpi)
-        return img
+        return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
 
 
-def _copy_image_to_clipboard(img: Image.Image) -> None:
-    """이미지를 클립보드에 PNG로 복사합니다 (DPI 메타데이터 포함)."""
-    dpi = img.info.get("dpi", (96, 96))
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", dpi=dpi)
-    png_data = buf.getvalue()
+def _copy_image_to_clipboard(img: Image.Image, scale: float) -> None:
+    """이미지를 클립보드에 복사합니다.
+
+    픽셀은 원본 그대로 유지하고, DPI를 96/scale로 설정하여
+    붙여넣기 시 표시 크기만 줄입니다 (화질 손실 없음).
+    """
+    target_dpi = int(96 / scale)
 
     system = platform.system()
-    if system == "Linux":
+    if system == "Windows":
+        import win32clipboard
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="BMP", dpi=(target_dpi, target_dpi))
+        dib_data = buf.getvalue()[14:]  # BMP 파일 헤더 14바이트 제거 → DIB
+        buf.close()
+        win32clipboard.OpenClipboard()
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, dib_data)
+        win32clipboard.CloseClipboard()
+    elif system == "Linux":
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", dpi=(target_dpi, target_dpi))
         proc = subprocess.Popen(
             ["xclip", "-selection", "clipboard", "-t", "image/png"],
             stdin=subprocess.PIPE,
         )
-        proc.communicate(png_data)
+        proc.communicate(buf.getvalue())
     elif system == "Darwin":
-        # macOS: osascript를 통해 클립보드에 복사
         import tempfile, os
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        tmp.write(png_data)
+        img.save(tmp, format="PNG", dpi=(target_dpi, target_dpi))
         tmp.close()
         subprocess.run([
             "osascript", "-e",
             f'set the clipboard to (read (POSIX file "{tmp.name}") as «class PNGf»)',
         ])
         os.unlink(tmp.name)
-    elif system == "Windows":
-        import win32clipboard
-        buf_bmp = io.BytesIO()
-        img.save(buf_bmp, format="BMP")
-        bmp_data = buf_bmp.getvalue()[14:]  # BMP 헤더 제거
-        win32clipboard.OpenClipboard()
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, bmp_data)
-        win32clipboard.CloseClipboard()
 
 
 class ScreenshotTool(BaseTool):
@@ -249,14 +235,9 @@ class ScreenshotTool(BaseTool):
 
     def _do_capture(self) -> None:
         img = _capture_region(self.bbox)
-        dpi = img.info.get("dpi", (96, 96))
-
-        if self.scale < 1.0:
-            new_w = max(1, int(img.width * self.scale))
-            new_h = max(1, int(img.height * self.scale))
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            img.info["dpi"] = dpi  # 리사이즈 후에도 원본 DPI 유지
-
-        _copy_image_to_clipboard(img)
+        _copy_image_to_clipboard(img, self.scale)
         w, h = img.size
-        self.status_label.config(text=f"✓ 클립보드에 복사됨 ({w}×{h}px)")
+        display_pct = int(self.scale * 100)
+        self.status_label.config(
+            text=f"✓ 클립보드 복사 ({w}×{h}px, 표시 {display_pct}%)"
+        )
