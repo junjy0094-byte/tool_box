@@ -22,13 +22,20 @@ class RegionSelector(tk.Toplevel):
         self.start_x = self.start_y = 0
         self.rect_id = None
 
-        self.attributes("-fullscreen", True)
+        # 화면 전체 크기를 명시적으로 가져와 geometry 설정
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        self.overrideredirect(True)
+        self.geometry(f"{screen_w}x{screen_h}+0+0")
         self.attributes("-alpha", 0.3)
         self.configure(bg="black")
         self.lift()
         self.attributes("-topmost", True)
 
-        self.canvas = tk.Canvas(self, cursor="cross", bg="black", highlightthickness=0)
+        self.canvas = tk.Canvas(
+            self, cursor="cross", bg="black", highlightthickness=0,
+            width=screen_w, height=screen_h,
+        )
         self.canvas.pack(fill="both", expand=True)
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
@@ -148,12 +155,15 @@ class ScreenshotTool(BaseTool):
         self.scale_var = tk.DoubleVar(value=self.scale)
         self.scale_slider = ttk.Scale(
             inner, from_=0.1, to=1.0, variable=self.scale_var,
-            orient="horizontal", command=self._on_scale_change,
+            orient="horizontal", command=self._on_scale_slider_change,
         )
         self.scale_slider.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-        self.scale_label = ttk.Label(inner, text=f"{self.scale:.2f}")
-        self.scale_label.pack(side="left")
+        self.scale_entry = ttk.Entry(inner, width=6, justify="center")
+        self.scale_entry.insert(0, f"{self.scale:.2f}")
+        self.scale_entry.pack(side="left")
+        self.scale_entry.bind("<Return>", self._on_scale_entry_change)
+        self.scale_entry.bind("<FocusOut>", self._on_scale_entry_change)
 
         # ── 상태 표시줄 ──
         self.status_label = ttk.Label(parent, text="", foreground="gray")
@@ -165,11 +175,23 @@ class ScreenshotTool(BaseTool):
             return f"({x1}, {y1}) → ({x2}, {y2})  |  {x2 - x1}×{y2 - y1}px"
         return "저장된 좌표 없음"
 
-    def _on_scale_change(self, _=None) -> None:
-        val = round(self.scale_var.get(), 2)
+    def _apply_scale(self, val: float) -> None:
+        val = max(0.1, min(1.0, round(val, 2)))
         self.scale = val
-        self.scale_label.config(text=f"{val:.2f}")
+        self.scale_var.set(val)
+        self.scale_entry.delete(0, tk.END)
+        self.scale_entry.insert(0, f"{val:.2f}")
         self._save_config()
+
+    def _on_scale_slider_change(self, _=None) -> None:
+        self._apply_scale(self.scale_var.get())
+
+    def _on_scale_entry_change(self, _=None) -> None:
+        try:
+            val = float(self.scale_entry.get())
+        except ValueError:
+            return
+        self._apply_scale(val)
 
     def _new_capture(self) -> None:
         # 메인 윈도우 숨기기
