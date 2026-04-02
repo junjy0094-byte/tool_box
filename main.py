@@ -40,16 +40,14 @@ TOOLS = [
 ]
 # ─────────────────────────────────────────────────
 
-# Windows: windnd 사용 → 일반 tk.Tk() 로 충분
-# 비-Windows: tkinterdnd2 가 있으면 TkinterDnD.Tk() 사용
+# tkinterdnd2 가 있으면 TkinterDnD.Tk() 를 루트로 사용해야 DnD 가 동작한다.
+# Windows 포함 모든 플랫폼에서 동일하게 적용한다.
 def _make_root() -> tk.Tk:
-    if sys.platform != "win32":
-        try:
-            from tkinterdnd2 import TkinterDnD  # type: ignore
-            return TkinterDnD.Tk()
-        except Exception:
-            pass
-    return tk.Tk()
+    try:
+        from tkinterdnd2 import TkinterDnD  # type: ignore
+        return TkinterDnD.Tk()
+    except Exception:
+        return tk.Tk()
 
 
 def main() -> None:
