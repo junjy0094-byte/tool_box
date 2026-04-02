@@ -4,15 +4,26 @@ import difflib
 import hashlib
 import os
 import tkinter as tk
-from tkinter import filedialog, ttk
-from typing import Dict, List, Tuple
+from tkinter import filedialog, messagebox, ttk
+from typing import Dict, List, Optional, Tuple
 
 from tools.base_tool import BaseTool
 from tools._dnd_helper import has_dnd, register_drop_target
 
+# 그룹별 색상 (최대 8색 순환)
+_GROUP_COLORS = [
+    "#1155BB",  # blue
+    "#117711",  # green
+    "#882299",  # purple
+    "#AA5500",  # brown
+    "#008888",  # teal
+    "#AA2222",  # red
+    "#666600",  # olive
+    "#005577",  # navy
+]
+
 
 def _file_hash(filepath: str) -> str:
-    """파일 MD5 해시를 반환한다."""
     h = hashlib.md5()
     try:
         with open(filepath, "rb") as f:
@@ -24,7 +35,6 @@ def _file_hash(filepath: str) -> str:
 
 
 def _read_lines(filepath: str) -> List[str]:
-    """파일을 줄 단위로 읽는다."""
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
             return f.readlines()
@@ -32,6 +42,20 @@ def _read_lines(filepath: str) -> List[str]:
         return []
 
 
+def _path_tail(filepath: str, depth: int) -> str:
+    """파일 경로의 마지막 depth 개 구성요소를 반환한다."""
+    parts: List[str] = []
+    p = filepath
+    for _ in range(depth):
+        head, tail = os.path.split(p)
+        if tail:
+            parts.insert(0, tail)
+            p = head
+        else:
+            if p:
+                parts.insert(0, p)
+            break
+    return os.path.join(*parts) if parts else filepath
 
 
 class FileCompareTool(BaseTool):
@@ -50,46 +74,60 @@ class FileCompareTool(BaseTool):
 
     def build_ui(self, parent: tk.Frame) -> None:
         self._files: List[str] = []
+        # 마지막 similarity 결과: {filepath: gid}  /  None = 미실행
+        self._group_map: Optional[Dict[str, int]] = None
+        # 내부 드래그 추적
+        self._drag_idx: Optional[int] = None
+        self._drag_start: Optional[Tuple[int, int]] = None
 
-        # 상단: 파일 목록
-        list_frame = ttk.LabelFrame(
+        # ── 상단: 파일 목록 ──────────────────────────────────────────────────
+        list_lf = ttk.LabelFrame(
             parent,
-            text="파일 목록" + ("  (드래그 앤 드롭 지원)" if has_dnd() else ""),
+            text="파일 목록" + ("  (외부 파일 드래그 앤 드롭 지원)" if has_dnd() else ""),
         )
-        list_frame.pack(fill="x", padx=6, pady=(6, 3))
+        list_lf.pack(fill="x", padx=6, pady=(6, 2))
 
-        btn_row = ttk.Frame(list_frame)
+        btn_row = ttk.Frame(list_lf)
         btn_row.pack(fill="x", padx=4, pady=(4, 2))
 
-        ttk.Button(btn_row, text="파일 추가", command=self._add_files).pack(
-            side="left", padx=(0, 4)
-        )
-        ttk.Button(btn_row, text="선택 제거", command=self._remove_selected).pack(
-            side="left", padx=(0, 4)
-        )
-        ttk.Button(btn_row, text="전체 제거", command=self._clear_files).pack(
-            side="left", padx=(0, 16)
-        )
-        ttk.Button(btn_row, text="동일/다름 판단", command=self._check_similarity).pack(
-            side="left"
-        )
+        ttk.Button(btn_row, text="파일 추가",    command=self._add_files).pack(side="left", padx=(0, 3))
+        ttk.Button(btn_row, text="선택 제거",    command=self._remove_selected).pack(side="left", padx=(0, 3))
+        ttk.Button(btn_row, text="전체 제거",    command=self._clear_files).pack(side="left", padx=(0, 10))
+        ttk.Button(btn_row, text="동일/다름 판단", command=self._check_similarity).pack(side="left", padx=(0, 3))
+        ttk.Button(btn_row, text="선택 파일 동기화", command=self._sync_selected).pack(side="left")
 
-        lb_frame = ttk.Frame(list_frame)
-        lb_frame.pack(fill="x", padx=4, pady=(0, 4))
+        # 경로 깊이 설정 (우측)
+        ttk.Label(btn_row, text="경로 깊이:").pack(side="right")
+        self._depth_var = tk.IntVar(value=3)
+        depth_sb = ttk.Spinbox(
+            btn_row, from_=1, to=8, width=3, textvariable=self._depth_var,
+            command=self._on_depth_changed,
+        )
+        depth_sb.pack(side="right", padx=(0, 4))
+        depth_sb.bind("<Return>", lambda _e: self._on_depth_changed())
+
+        # 파일 리스트박스
+        lb_row = ttk.Frame(list_lf)
+        lb_row.pack(fill="x", padx=4, pady=(0, 4))
 
         self._file_lb = tk.Listbox(
-            lb_frame, height=5, selectmode="extended", activestyle="none"
+            lb_row, height=5, selectmode="extended", activestyle="none",
         )
         self._file_lb.pack(side="left", fill="both", expand=True)
-
-        sb = ttk.Scrollbar(lb_frame, orient="vertical", command=self._file_lb.yview)
+        sb = ttk.Scrollbar(lb_row, orient="vertical", command=self._file_lb.yview)
         sb.pack(side="left", fill="y")
         self._file_lb.configure(yscrollcommand=sb.set)
 
+        # 외부 파일 드롭
         if has_dnd():
             register_drop_target(self._file_lb, self._load_paths)
 
-        # 요약 레이블
+        # 내부 드래그 (목록 → A/B 패널)
+        self._file_lb.bind("<ButtonPress-1>",  self._on_lb_press)
+        self._file_lb.bind("<B1-Motion>",       self._on_lb_motion)
+        self._file_lb.bind("<ButtonRelease-1>", self._on_lb_release)
+
+        # 요약
         self._summary_var = tk.StringVar(
             value="파일을 추가하고 '동일/다름 판단' 버튼을 누르세요."
         )
@@ -97,50 +135,61 @@ class FileCompareTool(BaseTool):
             fill="x", padx=10, pady=(0, 2)
         )
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=6, pady=4)
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=6, pady=3)
 
-        # 하단: 상세 비교
-        detail_frame = ttk.LabelFrame(parent, text="상세 비교")
-        detail_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        # ── 하단: 상세 비교 ──────────────────────────────────────────────────
+        detail_lf = ttk.LabelFrame(
+            parent,
+            text="상세 비교  ─  위 목록에서 아래 A·B 영역으로 드래그하여 파일 지정",
+        )
+        detail_lf.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
-        # 파일 선택 콤보
-        sel_row = ttk.Frame(detail_frame)
+        sel_row = ttk.Frame(detail_lf)
         sel_row.pack(fill="x", padx=4, pady=(4, 2))
 
         ttk.Label(sel_row, text="파일 A:").pack(side="left")
-        self._combo_a = ttk.Combobox(sel_row, state="readonly", width=28)
-        self._combo_a.pack(side="left", padx=(4, 10))
+        self._combo_a = ttk.Combobox(sel_row, state="readonly", width=26)
+        self._combo_a.pack(side="left", padx=(4, 8))
 
         ttk.Label(sel_row, text="파일 B:").pack(side="left")
-        self._combo_b = ttk.Combobox(sel_row, state="readonly", width=28)
-        self._combo_b.pack(side="left", padx=(4, 10))
+        self._combo_b = ttk.Combobox(sel_row, state="readonly", width=26)
+        self._combo_b.pack(side="left", padx=(4, 8))
 
         ttk.Button(sel_row, text="상세 비교", command=self._do_diff).pack(side="left")
 
-        # 차이 요약
         self._diff_summary_var = tk.StringVar(value="")
-        ttk.Label(detail_frame, textvariable=self._diff_summary_var, anchor="w").pack(
+        ttk.Label(detail_lf, textvariable=self._diff_summary_var, anchor="w").pack(
             fill="x", padx=4, pady=(0, 2)
         )
 
-        # Side-by-side diff 뷰
-        diff_pw = ttk.PanedWindow(detail_frame, orient="horizontal")
+        diff_pw = ttk.PanedWindow(detail_lf, orient="horizontal")
         diff_pw.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
-        left_pane = ttk.Frame(diff_pw)
-        right_pane = ttk.Frame(diff_pw)
-        diff_pw.add(left_pane, weight=1)
-        diff_pw.add(right_pane, weight=1)
+        self._frame_a = ttk.Frame(diff_pw)
+        self._frame_b = ttk.Frame(diff_pw)
+        diff_pw.add(self._frame_a, weight=1)
+        diff_pw.add(self._frame_b, weight=1)
 
-        self._lbl_a = ttk.Label(left_pane, text="파일 A", anchor="w", foreground="#444")
+        # 각 패널의 드롭 헤더 레이블 (드래그 힌트 겸 드롭 타겟)
+        self._lbl_a = tk.Label(
+            self._frame_a,
+            text="[ 파일 A ]  ← 위 목록에서 드래그",
+            anchor="w", bg="#E8EEF8", fg="#336",
+            relief="groove", padx=4,
+        )
         self._lbl_a.pack(fill="x")
-        self._txt_a = self._make_text_view(left_pane, side="left")
 
-        self._lbl_b = ttk.Label(right_pane, text="파일 B", anchor="w", foreground="#444")
+        self._lbl_b = tk.Label(
+            self._frame_b,
+            text="[ 파일 B ]  ← 위 목록에서 드래그",
+            anchor="w", bg="#E8EEF8", fg="#336",
+            relief="groove", padx=4,
+        )
         self._lbl_b.pack(fill="x")
-        self._txt_b = self._make_text_view(right_pane, side="right")
 
-        # 동기 스크롤
+        self._txt_a = self._make_text_view(self._frame_a, "left")
+        self._txt_b = self._make_text_view(self._frame_b, "right")
+
         self._txt_a.configure(yscrollcommand=self._scroll_sync_a)
         self._txt_b.configure(yscrollcommand=self._scroll_sync_b)
         self._vsb_a.configure(command=self._yview_both)
@@ -150,22 +199,18 @@ class FileCompareTool(BaseTool):
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
 
-        txt = tk.Text(
-            frame, wrap="none", state="disabled",
-            font=("Consolas", 9), relief="flat",
-        )
+        txt = tk.Text(frame, wrap="none", state="disabled",
+                      font=("Consolas", 9), relief="flat")
         if side == "left":
             self._vsb_a = ttk.Scrollbar(frame, orient="vertical")
             self._hsb_a = ttk.Scrollbar(frame, orient="horizontal", command=txt.xview)
             txt.configure(xscrollcommand=self._hsb_a.set)
-            vsb = self._vsb_a
-            hsb = self._hsb_a
+            vsb, hsb = self._vsb_a, self._hsb_a
         else:
             self._vsb_b = ttk.Scrollbar(frame, orient="vertical")
             self._hsb_b = ttk.Scrollbar(frame, orient="horizontal", command=txt.xview)
             txt.configure(xscrollcommand=self._hsb_b.set)
-            vsb = self._vsb_b
-            hsb = self._hsb_b
+            vsb, hsb = self._vsb_b, self._hsb_b
 
         txt.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
@@ -179,10 +224,9 @@ class FileCompareTool(BaseTool):
         txt.tag_configure("same",    background="#FFFFFF")
         txt.tag_configure("empty",   background="#F0F0F0")
         txt.tag_configure("linenum", foreground="#999999")
-
         return txt
 
-    # ── 스크롤 동기화 ──────────────────────────────────────────────────────────
+    # ── 스크롤 동기화 ─────────────────────────────────────────────────────────
 
     def _scroll_sync_a(self, *args):
         self._vsb_a.set(*args)
@@ -203,89 +247,260 @@ class FileCompareTool(BaseTool):
         self._load_paths(list(paths))
 
     def _load_paths(self, paths: List[str]) -> None:
+        added = 0
         for p in paths:
             if os.path.isfile(p) and p not in self._files:
                 self._files.append(p)
-                self._file_lb.insert("end", os.path.basename(p))
-        self._update_combos()
-        self._summary_var.set(
-            f"파일 {len(self._files)}개 로드됨  |  '동일/다름 판단' 버튼을 누르세요."
-        )
+                added += 1
+        if added:
+            self._group_map = None  # similarity 결과 초기화
+            self._refresh_listbox()
+            self._update_combos()
+            self._summary_var.set(
+                f"파일 {len(self._files)}개 로드됨  |  '동일/다름 판단' 버튼을 누르세요."
+            )
 
     def _remove_selected(self) -> None:
         for idx in reversed(self._file_lb.curselection()):
             self._files.pop(idx)
-            self._file_lb.delete(idx)
+        self._group_map = None
+        self._refresh_listbox()
         self._update_combos()
         self._summary_var.set(f"파일 {len(self._files)}개 로드됨")
 
     def _clear_files(self) -> None:
         self._files.clear()
+        self._group_map = None
         self._file_lb.delete(0, "end")
         self._update_combos()
         self._clear_diff()
         self._summary_var.set("파일을 추가하고 '동일/다름 판단' 버튼을 누르세요.")
 
+    def _on_depth_changed(self) -> None:
+        """경로 깊이 변경 시 리스트박스 레이블을 갱신한다."""
+        self._refresh_listbox()
+        self._update_combos()
+
+    def _refresh_listbox(self) -> None:
+        """현재 self._files 와 self._group_map 상태로 리스트박스를 다시 그린다."""
+        self._file_lb.delete(0, "end")
+        names = self._short_names()
+        if self._group_map is None:
+            for name in names:
+                self._file_lb.insert("end", name)
+        else:
+            # similarity 결과 포함 렌더링
+            group_sizes: Dict[int, int] = {}
+            for gid in self._group_map.values():
+                group_sizes[gid] = group_sizes.get(gid, 0) + 1
+
+            for fp, name in zip(self._files, names):
+                gid = self._group_map.get(fp, 0)
+                size = group_sizes.get(gid, 1)
+                badge = "동일" if size > 1 else "고유"
+                color = _GROUP_COLORS[(gid - 1) % len(_GROUP_COLORS)]
+                self._file_lb.insert("end", f"[G{gid}] {badge}  {name}")
+                self._file_lb.itemconfig("end", foreground=color)
+
     def _update_combos(self) -> None:
         names = self._short_names()
+        cur_a = self._combo_a.get()
+        cur_b = self._combo_b.get()
         self._combo_a["values"] = names
         self._combo_b["values"] = names
         if names:
-            if self._combo_a.get() not in names:
-                self._combo_a.current(0)
-            if self._combo_b.get() not in names:
-                self._combo_b.current(min(1, len(names) - 1))
+            self._combo_a.set(cur_a if cur_a in names else names[0])
+            self._combo_b.set(cur_b if cur_b in names else names[min(1, len(names) - 1)])
         else:
             self._combo_a.set("")
             self._combo_b.set("")
 
-    # ── 동일/다름 판단 ────────────────────────────────────────────────────────
+    # ── 동일/다름 판단 (클러스터링) ───────────────────────────────────────────
 
     def _check_similarity(self) -> None:
         if len(self._files) < 2:
             self._summary_var.set("비교하려면 2개 이상의 파일이 필요합니다.")
             return
 
-        hash_groups: Dict[str, List[str]] = {}
+        hash_to_fps: Dict[str, List[str]] = {}
         for fp in self._files:
             h = _file_hash(fp)
-            hash_groups.setdefault(h, []).append(fp)
+            hash_to_fps.setdefault(h, []).append(fp)
 
-        # 파일별 그룹 번호 맵
-        file_group: Dict[str, int] = {}
-        for gid, fps in enumerate(hash_groups.values(), 1):
+        # 그룹 ID 부여: 해시별로 오름차순 번호
+        self._group_map = {}
+        for gid, fps in enumerate(hash_to_fps.values(), 1):
             for fp in fps:
-                file_group[fp] = gid
+                self._group_map[fp] = gid
 
-        short_names = self._short_names()
-        name_map = dict(zip(self._files, short_names))
+        self._refresh_listbox()
 
-        # 리스트박스 재구성 (색상 포함)
-        self._file_lb.delete(0, "end")
-        same_cnt = 0
-        unique_cnt = 0
-
-        for fp in self._files:
-            gid = file_group[fp]
-            group_size = sum(1 for g in file_group.values() if g == gid)
-            is_dup = group_size > 1
-
-            badge = "● 동일" if is_dup else "● 고유"
-            self._file_lb.insert("end", f"{badge}  {name_map[fp]}")
-            self._file_lb.itemconfig(
-                "end",
-                foreground="#1155BB" if is_dup else "#BB2222",
-            )
-            if is_dup:
-                same_cnt += 1
-            else:
-                unique_cnt += 1
-
-        groups = len(hash_groups)
+        total = len(self._files)
+        n_groups = len(hash_to_fps)
+        dup_cnt = sum(1 for fp in self._files
+                      if sum(1 for g in self._group_map.values()
+                             if g == self._group_map[fp]) > 1)
+        uniq_cnt = total - dup_cnt
         self._summary_var.set(
-            f"파일 {len(self._files)}개  |  그룹 {groups}개  "
-            f"|  동일(중복) {same_cnt}개  |  고유 {unique_cnt}개"
+            f"파일 {total}개  |  그룹 {n_groups}개  "
+            f"|  동일(중복) {dup_cnt}개  |  고유 {uniq_cnt}개"
         )
+
+    # ── 선택 파일 동기화 ──────────────────────────────────────────────────────
+
+    def _sync_selected(self) -> None:
+        """선택한 파일들을 지정한 기준 파일의 내용으로 덮어쓴다."""
+        sel_indices = list(self._file_lb.curselection())
+        if not sel_indices:
+            messagebox.showinfo("선택 파일 동기화", "덮어쓸 파일을 먼저 선택하세요.")
+            return
+        if len(self._files) < 2:
+            messagebox.showinfo("선택 파일 동기화", "파일이 2개 이상 필요합니다.")
+            return
+
+        targets = [self._files[i] for i in sel_indices]
+        names = self._short_names()
+
+        # ── 다이얼로그 ──
+        dlg = tk.Toplevel()
+        dlg.title("선택 파일 동기화")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="기준 파일 (복사 원본):").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
+        src_var = tk.StringVar(value=names[0])
+        src_cb = ttk.Combobox(dlg, textvariable=src_var, values=names, state="readonly", width=40)
+        src_cb.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 6), sticky="ew")
+
+        ttk.Label(dlg, text="덮어쓸 파일 목록:").grid(row=2, column=0, sticky="w", padx=10)
+        tgt_lb = tk.Listbox(dlg, height=min(len(targets), 8), width=50)
+        for fp in targets:
+            tgt_lb.insert("end", fp)
+        tgt_lb.grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 10), sticky="ew")
+
+        def do_sync():
+            src_name = src_var.get()
+            name_to_path = dict(zip(names, self._files))
+            src_path = name_to_path.get(src_name)
+            if not src_path:
+                return
+            # 기준 파일이 대상 목록에 있으면 제외
+            real_targets = [t for t in targets if t != src_path]
+            if not real_targets:
+                messagebox.showinfo("동기화", "덮어쓸 파일이 없습니다 (기준 파일 제외 후).")
+                dlg.destroy()
+                return
+            msg = (
+                f"아래 {len(real_targets)}개 파일을\n"
+                f"  기준: {os.path.basename(src_path)}\n"
+                "의 내용으로 덮어씁니다.\n\n"
+                "이 작업은 되돌릴 수 없습니다. 계속하시겠습니까?"
+            )
+            if not messagebox.askyesno("덮어쓰기 확인", msg, parent=dlg):
+                return
+            errors = []
+            for tp in real_targets:
+                try:
+                    with open(src_path, "rb") as fsrc, open(tp, "wb") as fdst:
+                        fdst.write(fsrc.read())
+                except OSError as e:
+                    errors.append(f"{os.path.basename(tp)}: {e}")
+            dlg.destroy()
+            if errors:
+                messagebox.showerror("동기화 오류", "\n".join(errors))
+            else:
+                messagebox.showinfo("동기화 완료", f"{len(real_targets)}개 파일 동기화 완료.")
+            # 동기화 후 similarity 재판단
+            self._group_map = None
+            self._refresh_listbox()
+
+        btn_row2 = ttk.Frame(dlg)
+        btn_row2.grid(row=4, column=0, columnspan=2, pady=(0, 10))
+        ttk.Button(btn_row2, text="덮어쓰기", command=do_sync).pack(side="left", padx=8)
+        ttk.Button(btn_row2, text="취소", command=dlg.destroy).pack(side="left")
+
+        dlg.columnconfigure(0, weight=1)
+
+    # ── 내부 드래그 (리스트박스 → A/B 패널) ──────────────────────────────────
+
+    def _on_lb_press(self, event: tk.Event) -> None:
+        idx = self._file_lb.nearest(event.y)
+        if 0 <= idx < len(self._files):
+            self._drag_idx = idx
+            self._drag_start = (event.x_root, event.y_root)
+        else:
+            self._drag_idx = None
+
+    def _on_lb_motion(self, event: tk.Event) -> None:
+        if self._drag_idx is None or self._drag_start is None:
+            return
+        dx = abs(event.x_root - self._drag_start[0])
+        dy = abs(event.y_root - self._drag_start[1])
+        if dx + dy > 6:
+            self._file_lb.configure(cursor="fleur")
+            # 드롭 타겟 강조
+            w = self._file_lb.winfo_containing(event.x_root, event.y_root)
+            if self._widget_in(w, self._frame_a):
+                self._lbl_a.configure(bg="#C8D8F8")
+                self._lbl_b.configure(bg="#E8EEF8")
+            elif self._widget_in(w, self._frame_b):
+                self._lbl_b.configure(bg="#C8D8F8")
+                self._lbl_a.configure(bg="#E8EEF8")
+            else:
+                self._lbl_a.configure(bg="#E8EEF8")
+                self._lbl_b.configure(bg="#E8EEF8")
+
+    def _on_lb_release(self, event: tk.Event) -> None:
+        self._file_lb.configure(cursor="")
+        self._lbl_a.configure(bg="#E8EEF8")
+        self._lbl_b.configure(bg="#E8EEF8")
+
+        if self._drag_idx is None or self._drag_start is None:
+            return
+
+        dx = abs(event.x_root - self._drag_start[0])
+        dy = abs(event.y_root - self._drag_start[1])
+        dragged = dx + dy > 6
+
+        self._drag_start = None
+        idx = self._drag_idx
+        self._drag_idx = None
+
+        if not dragged:
+            return
+
+        w = self._file_lb.winfo_containing(event.x_root, event.y_root)
+        names = self._short_names()
+        if 0 <= idx < len(names):
+            if self._widget_in(w, self._frame_a):
+                self._set_diff_file("a", idx)
+            elif self._widget_in(w, self._frame_b):
+                self._set_diff_file("b", idx)
+
+    def _widget_in(self, widget, frame) -> bool:
+        """widget 이 frame 의 자손(또는 자기 자신)이면 True."""
+        w = widget
+        while w is not None:
+            if w == frame:
+                return True
+            try:
+                w = w.master
+            except Exception:
+                return False
+        return False
+
+    def _set_diff_file(self, panel: str, idx: int) -> None:
+        names = self._short_names()
+        name = names[idx]
+        if panel == "a":
+            self._combo_a.set(name)
+            self._lbl_a.configure(text=f"[ 파일 A ]  {name}")
+        else:
+            self._combo_b.set(name)
+            self._lbl_b.configure(text=f"[ 파일 B ]  {name}")
+        # 양쪽 모두 지정됐으면 즉시 비교
+        if self._combo_a.get() and self._combo_b.get():
+            self._do_diff()
 
     # ── 상세 비교 ─────────────────────────────────────────────────────────────
 
@@ -298,87 +513,60 @@ class FileCompareTool(BaseTool):
             self._diff_summary_var.set("파일 A와 파일 B를 선택하세요.")
             return
         if name_a == name_b:
-            self._diff_summary_var.set("같은 파일을 선택했습니다. 서로 다른 파일을 선택하세요.")
+            self._diff_summary_var.set("같은 파일입니다. 서로 다른 파일을 선택하세요.")
             return
 
         name_to_path = dict(zip(names, self._files))
         path_a = name_to_path.get(name_a)
         path_b = name_to_path.get(name_b)
-
         if not path_a or not path_b:
             return
 
-        self._lbl_a.config(text=name_a)
-        self._lbl_b.config(text=name_b)
+        self._lbl_a.configure(text=f"[ 파일 A ]  {name_a}")
+        self._lbl_b.configure(text=f"[ 파일 B ]  {name_b}")
 
-        lines_a = _read_lines(path_a)
-        lines_b = _read_lines(path_b)
-        self._render_diff(lines_a, lines_b)
+        self._render_diff(_read_lines(path_a), _read_lines(path_b))
 
-    def _render_diff(
-        self,
-        lines_a: List[str],
-        lines_b: List[str],
-    ) -> None:
-        """SequenceMatcher 결과를 Side-by-Side로 렌더링한다."""
+    def _render_diff(self, lines_a: List[str], lines_b: List[str]) -> None:
         matcher = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
-
-        # (tag, linenum_str, text) 목록
-        left_buf: List[Tuple[str, str, str]] = []
+        left_buf:  List[Tuple[str, str, str]] = []
         right_buf: List[Tuple[str, str, str]] = []
-
         added = deleted = changed = 0
 
         for op, i1, i2, j1, j2 in matcher.get_opcodes():
             if op == "equal":
                 for li, ri in zip(range(i1, i2), range(j1, j2)):
-                    left_buf.append(("same", str(li + 1), lines_a[li]))
-                    right_buf.append(("same", str(ri + 1), lines_b[ri]))
-
+                    left_buf.append(("same",    str(li + 1), lines_a[li]))
+                    right_buf.append(("same",   str(ri + 1), lines_b[ri]))
             elif op == "replace":
-                l_block = lines_a[i1:i2]
-                r_block = lines_b[j1:j2]
-                changed += max(len(l_block), len(r_block))
-                for k in range(max(len(l_block), len(r_block))):
-                    if k < len(l_block):
-                        left_buf.append(("changed", str(i1 + k + 1), l_block[k]))
-                    else:
-                        left_buf.append(("empty", "", ""))
-                    if k < len(r_block):
-                        right_buf.append(("changed", str(j1 + k + 1), r_block[k]))
-                    else:
-                        right_buf.append(("empty", "", ""))
-
+                lb, rb = lines_a[i1:i2], lines_b[j1:j2]
+                changed += max(len(lb), len(rb))
+                for k in range(max(len(lb), len(rb))):
+                    left_buf.append(("changed", str(i1+k+1), lb[k]) if k < len(lb) else ("empty", "", ""))
+                    right_buf.append(("changed", str(j1+k+1), rb[k]) if k < len(rb) else ("empty", "", ""))
             elif op == "delete":
                 deleted += i2 - i1
                 for li in range(i1, i2):
                     left_buf.append(("removed", str(li + 1), lines_a[li]))
-                    right_buf.append(("empty", "", ""))
-
+                    right_buf.append(("empty",  "", ""))
             elif op == "insert":
                 added += j2 - j1
                 for ri in range(j1, j2):
-                    left_buf.append(("empty", "", ""))
-                    right_buf.append(("added", str(ri + 1), lines_b[ri]))
+                    left_buf.append(("empty",  "", ""))
+                    right_buf.append(("added",  str(ri + 1), lines_b[ri]))
 
         self._fill_text(self._txt_a, left_buf)
         self._fill_text(self._txt_b, right_buf)
-
         self._diff_summary_var.set(
             f"추가: +{added}줄  |  삭제: -{deleted}줄  |  변경: ~{changed}줄"
         )
 
-    def _fill_text(
-        self,
-        txt: tk.Text,
-        content: List[Tuple[str, str, str]],
-    ) -> None:
+    def _fill_text(self, txt: tk.Text, content: List[Tuple[str, str, str]]) -> None:
         txt.config(state="normal")
         txt.delete("1.0", "end")
         for tag, linenum, text in content:
-            num_str = f"{linenum:>6} " if linenum else "       "
-            txt.insert("end", num_str, "linenum")
-            line_text = text if text else "\n"
+            txt.insert("end", f"{linenum:>6} " if linenum else "       ", "linenum")
+            line_text = text or "\n"
             txt.insert("end", line_text, tag)
             if line_text and not line_text.endswith("\n"):
                 txt.insert("end", "\n", tag)
@@ -391,11 +579,8 @@ class FileCompareTool(BaseTool):
             txt.config(state="disabled")
         self._diff_summary_var.set("")
 
+    # ── 경로 표시 ─────────────────────────────────────────────────────────────
+
     def _short_names(self) -> List[str]:
-        basenames = [os.path.basename(fp) for fp in self._files]
-        if len(basenames) == len(set(basenames)):
-            return basenames
-        return [
-            os.path.join(os.path.basename(os.path.dirname(fp)), os.path.basename(fp))
-            for fp in self._files
-        ]
+        depth = max(1, self._depth_var.get())
+        return [_path_tail(fp, depth) for fp in self._files]
