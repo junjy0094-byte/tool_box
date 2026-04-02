@@ -1,3 +1,4 @@
 Pillow
 mss
 tkinterdnd2
+windnd; sys_platform == "win32"

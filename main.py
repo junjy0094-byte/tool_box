@@ -27,13 +27,6 @@ def _enable_dpi_awareness() -> None:
 
 _enable_dpi_awareness()
 
-# ── 드래그 앤 드롭 지원 ──────────────────────────
-try:
-    from tkinterdnd2 import TkinterDnD
-    _HAS_DND = True
-except ImportError:
-    _HAS_DND = False
-
 # ── 등록할 도구 목록 ─────────────────────────────
 from tools.screenshot_tool import ScreenshotTool
 from tools.variable_compare_tool import VariableCompareTool
@@ -47,9 +40,20 @@ TOOLS = [
 ]
 # ─────────────────────────────────────────────────
 
+# Windows: windnd 사용 → 일반 tk.Tk() 로 충분
+# 비-Windows: tkinterdnd2 가 있으면 TkinterDnD.Tk() 사용
+def _make_root() -> tk.Tk:
+    if sys.platform != "win32":
+        try:
+            from tkinterdnd2 import TkinterDnD  # type: ignore
+            return TkinterDnD.Tk()
+        except Exception:
+            pass
+    return tk.Tk()
+
 
 def main() -> None:
-    root = TkinterDnD.Tk() if _HAS_DND else tk.Tk()
+    root = _make_root()
     root.title("Tool Box")
     root.geometry("800x600")
     root.minsize(600, 400)

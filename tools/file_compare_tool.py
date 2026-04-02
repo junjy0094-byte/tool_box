@@ -3,18 +3,12 @@
 import difflib
 import hashlib
 import os
-import re
 import tkinter as tk
 from tkinter import filedialog, ttk
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from tools.base_tool import BaseTool
-
-try:
-    from tkinterdnd2 import DND_FILES
-    _HAS_DND = True
-except ImportError:
-    _HAS_DND = False
+from tools._dnd_helper import has_dnd, register_drop_target
 
 
 def _file_hash(filepath: str) -> str:
@@ -38,14 +32,6 @@ def _read_lines(filepath: str) -> List[str]:
         return []
 
 
-def _parse_drop_data(data: str) -> List[str]:
-    """TkinterDnD drop 이벤트 데이터를 파일 경로 리스트로 변환한다."""
-    paths = []
-    for token in re.findall(r"\{([^}]+)\}|(\S+)", data):
-        path = token[0] or token[1]
-        if path:
-            paths.append(path)
-    return paths
 
 
 class FileCompareTool(BaseTool):
@@ -68,7 +54,7 @@ class FileCompareTool(BaseTool):
         # 상단: 파일 목록
         list_frame = ttk.LabelFrame(
             parent,
-            text="파일 목록" + ("  (드래그 앤 드롭 지원)" if _HAS_DND else ""),
+            text="파일 목록" + ("  (드래그 앤 드롭 지원)" if has_dnd() else ""),
         )
         list_frame.pack(fill="x", padx=6, pady=(6, 3))
 
@@ -100,11 +86,8 @@ class FileCompareTool(BaseTool):
         sb.pack(side="left", fill="y")
         self._file_lb.configure(yscrollcommand=sb.set)
 
-        if _HAS_DND:
-            self._file_lb.drop_target_register(DND_FILES)
-            self._file_lb.dnd_bind("<<DropEnter>>",    lambda e: "copy")
-            self._file_lb.dnd_bind("<<DropPosition>>", lambda e: "copy")
-            self._file_lb.dnd_bind("<<Drop>>",         self._on_list_drop)
+        if has_dnd():
+            register_drop_target(self._file_lb, self._load_paths)
 
         # 요약 레이블
         self._summary_var = tk.StringVar(
@@ -218,14 +201,6 @@ class FileCompareTool(BaseTool):
     def _add_files(self) -> None:
         paths = filedialog.askopenfilenames(filetypes=self._FILETYPES)
         self._load_paths(list(paths))
-
-    def _on_list_drop(self, event) -> str:
-        try:
-            files = event.widget.tk.splitlist(event.data)
-        except Exception:
-            files = _parse_drop_data(event.data)
-        self._load_paths(list(files))
-        return event.action
 
     def _load_paths(self, paths: List[str]) -> None:
         for p in paths:
