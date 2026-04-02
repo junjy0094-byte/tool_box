@@ -3,6 +3,8 @@
 import difflib
 import hashlib
 import os
+import subprocess
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Tuple
@@ -122,10 +124,13 @@ class FileCompareTool(BaseTool):
         if has_dnd():
             register_drop_target(self._file_lb, self._load_paths)
 
-        # 내부 드래그 (목록 → A/B 패널)
+        # 내부 드래그 (목록 → A/B 패널) + 드래그 범위 선택 차단
         self._file_lb.bind("<ButtonPress-1>",  self._on_lb_press)
         self._file_lb.bind("<B1-Motion>",       self._on_lb_motion)
         self._file_lb.bind("<ButtonRelease-1>", self._on_lb_release)
+
+        # 우클릭 컨텍스트 메뉴 (외부 편집기에서 열기)
+        self._file_lb.bind("<Button-3>", self._on_lb_right_click)
 
         # 요약
         self._summary_var = tk.StringVar(
@@ -506,6 +511,48 @@ class FileCompareTool(BaseTool):
                 return False
         return False
 
+    def _on_lb_right_click(self, event: tk.Event) -> None:
+        """리스트박스 우클릭 시 컨텍스트 메뉴를 표시한다."""
+        idx = self._file_lb.nearest(event.y)
+        if idx < 0 or idx >= len(self._files):
+            return
+        # 우클릭한 항목도 선택에 포함
+        if idx not in self._file_lb.curselection():
+            self._file_lb.selection_clear(0, "end")
+            self._file_lb.selection_set(idx)
+
+        menu = tk.Menu(self._file_lb, tearoff=0)
+        sel = self._file_lb.curselection()
+        if len(sel) == 1:
+            menu.add_command(
+                label="외부 편집기에서 열기",
+                command=lambda: self._open_in_editor(self._files[sel[0]]),
+            )
+        elif len(sel) > 1:
+            menu.add_command(
+                label=f"선택한 {len(sel)}개 파일 외부 편집기에서 열기",
+                command=lambda: self._open_selected_in_editor(),
+            )
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _open_in_editor(self, filepath: str) -> None:
+        """OS 기본 연결 프로그램 또는 편집기로 파일을 연다."""
+        try:
+            if sys.platform == "win32":
+                os.startfile(filepath)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", filepath])
+            else:
+                subprocess.Popen(["xdg-open", filepath])
+        except OSError as e:
+            messagebox.showerror("열기 실패", f"파일을 열 수 없습니다:\n{e}")
+
+    def _open_selected_in_editor(self) -> None:
+        """선택된 모든 파일을 외부 편집기에서 연다."""
+        for i in self._file_lb.curselection():
+            if 0 <= i < len(self._files):
+                self._open_in_editor(self._files[i])
+
     def _set_diff_file(self, panel: str, idx: int) -> None:
         names = self._short_names()
         name = names[idx]
@@ -523,6 +570,15 @@ class FileCompareTool(BaseTool):
 
     def _do_diff(self) -> None:
         names = self._short_names()
+
+        # 리스트박스에서 정확히 2개 선택된 경우 콤보박스에 자동 세팅
+        sel = self._file_lb.curselection()
+        if len(sel) == 2:
+            idx_a, idx_b = sel
+            if 0 <= idx_a < len(names) and 0 <= idx_b < len(names):
+                self._combo_a.set(names[idx_a])
+                self._combo_b.set(names[idx_b])
+
         name_a = self._combo_a.get()
         name_b = self._combo_b.get()
 
