@@ -114,7 +114,7 @@ class FileCompareTool(BaseTool):
 
         # 파일 리스트박스
         lb_row = ttk.Frame(list_lf)
-        lb_row.pack(fill="x", padx=4, pady=(0, 4))
+        lb_row.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
         self._file_lb = tk.Listbox(
             lb_row, height=5, selectmode="extended", activestyle="none",
