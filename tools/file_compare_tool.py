@@ -333,7 +333,11 @@ class FileCompareTool(BaseTool):
             for fp in fps:
                 self._group_map[fp] = gid
 
+        # 동일 파일끼리 인접하도록 그룹 ID 기준 정렬 (같은 그룹 내 원래 순서 유지)
+        self._files.sort(key=lambda fp: self._group_map.get(fp, 0))
+
         self._refresh_listbox()
+        self._update_combos()
 
         total = len(self._files)
         n_groups = len(hash_to_fps)
@@ -349,49 +353,63 @@ class FileCompareTool(BaseTool):
     # ── 선택 파일 동기화 ──────────────────────────────────────────────────────
 
     def _sync_selected(self) -> None:
-        """선택한 파일들을 지정한 기준 파일의 내용으로 덮어쓴다."""
-        sel_indices = list(self._file_lb.curselection())
-        if not sel_indices:
-            messagebox.showinfo("선택 파일 동기화", "덮어쓸 파일을 먼저 선택하세요.")
-            return
+        """팝업에서 덮어쓸 파일을 멀티 선택하고 기준 파일을 지정해 동기화한다."""
         if len(self._files) < 2:
             messagebox.showinfo("선택 파일 동기화", "파일이 2개 이상 필요합니다.")
             return
 
-        targets = [self._files[i] for i in sel_indices]
         names = self._short_names()
+        # 현재 메인 리스트박스 선택을 초기 선택으로 활용
+        pre_sel = set(self._file_lb.curselection())
 
-        # ── 다이얼로그 ──
         dlg = tk.Toplevel()
         dlg.title("선택 파일 동기화")
-        dlg.resizable(False, False)
+        dlg.resizable(True, True)
         dlg.grab_set()
 
-        ttk.Label(dlg, text="기준 파일 (복사 원본):").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 2))
-        src_var = tk.StringVar(value=names[0])
-        src_cb = ttk.Combobox(dlg, textvariable=src_var, values=names, state="readonly", width=40)
-        src_cb.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 6), sticky="ew")
+        # ① 덮어쓸 파일 목록 (멀티 선택)
+        ttk.Label(
+            dlg, text="① 덮어쓸 파일 선택  (Ctrl / Shift 로 복수 선택):",
+        ).pack(anchor="w", padx=10, pady=(10, 2))
 
-        ttk.Label(dlg, text="덮어쓸 파일 목록:").grid(row=2, column=0, sticky="w", padx=10)
-        tgt_lb = tk.Listbox(dlg, height=min(len(targets), 8), width=50)
-        for fp in targets:
-            tgt_lb.insert("end", fp)
-        tgt_lb.grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 10), sticky="ew")
+        tgt_frame = ttk.Frame(dlg)
+        tgt_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        tgt_lb = tk.Listbox(tgt_frame, selectmode="extended", height=8, width=52)
+        tgt_sb = ttk.Scrollbar(tgt_frame, orient="vertical", command=tgt_lb.yview)
+        tgt_lb.configure(yscrollcommand=tgt_sb.set)
+        tgt_lb.pack(side="left", fill="both", expand=True)
+        tgt_sb.pack(side="left", fill="y")
+
+        for i, name in enumerate(names):
+            tgt_lb.insert("end", name)
+            if i in pre_sel:          # 메인 리스트박스 선택 상태 반영
+                tgt_lb.selection_set(i)
+
+        # ② 기준 파일 (소스)
+        ttk.Label(dlg, text="② 기준 파일 선택  (이 파일의 내용으로 덮어씁니다):").pack(
+            anchor="w", padx=10, pady=(0, 2)
+        )
+        src_var = tk.StringVar(value=names[0])
+        src_cb = ttk.Combobox(dlg, textvariable=src_var, values=names,
+                               state="readonly", width=50)
+        src_cb.pack(fill="x", padx=10, pady=(0, 8))
 
         def do_sync():
-            src_name = src_var.get()
+            tgt_indices = list(tgt_lb.curselection())
+            if not tgt_indices:
+                messagebox.showinfo("동기화", "덮어쓸 파일을 선택하세요.", parent=dlg)
+                return
             name_to_path = dict(zip(names, self._files))
-            src_path = name_to_path.get(src_name)
+            src_path = name_to_path.get(src_var.get())
             if not src_path:
                 return
-            # 기준 파일이 대상 목록에 있으면 제외
-            real_targets = [t for t in targets if t != src_path]
+            real_targets = [self._files[i] for i in tgt_indices
+                            if self._files[i] != src_path]
             if not real_targets:
-                messagebox.showinfo("동기화", "덮어쓸 파일이 없습니다 (기준 파일 제외 후).")
-                dlg.destroy()
+                messagebox.showinfo("동기화", "기준 파일 외 덮어쓸 파일이 없습니다.", parent=dlg)
                 return
             msg = (
-                f"아래 {len(real_targets)}개 파일을\n"
+                f"선택한 {len(real_targets)}개 파일을\n"
                 f"  기준: {os.path.basename(src_path)}\n"
                 "의 내용으로 덮어씁니다.\n\n"
                 "이 작업은 되돌릴 수 없습니다. 계속하시겠습니까?"
@@ -410,16 +428,13 @@ class FileCompareTool(BaseTool):
                 messagebox.showerror("동기화 오류", "\n".join(errors))
             else:
                 messagebox.showinfo("동기화 완료", f"{len(real_targets)}개 파일 동기화 완료.")
-            # 동기화 후 similarity 재판단
             self._group_map = None
             self._refresh_listbox()
 
-        btn_row2 = ttk.Frame(dlg)
-        btn_row2.grid(row=4, column=0, columnspan=2, pady=(0, 10))
-        ttk.Button(btn_row2, text="덮어쓰기", command=do_sync).pack(side="left", padx=8)
-        ttk.Button(btn_row2, text="취소", command=dlg.destroy).pack(side="left")
-
-        dlg.columnconfigure(0, weight=1)
+        btn_f = ttk.Frame(dlg)
+        btn_f.pack(pady=(0, 10))
+        ttk.Button(btn_f, text="덮어쓰기 실행", command=do_sync).pack(side="left", padx=8)
+        ttk.Button(btn_f, text="취소", command=dlg.destroy).pack(side="left")
 
     # ── 내부 드래그 (리스트박스 → A/B 패널) ──────────────────────────────────
 
@@ -431,24 +446,26 @@ class FileCompareTool(BaseTool):
         else:
             self._drag_idx = None
 
-    def _on_lb_motion(self, event: tk.Event) -> None:
-        if self._drag_idx is None or self._drag_start is None:
-            return
-        dx = abs(event.x_root - self._drag_start[0])
-        dy = abs(event.y_root - self._drag_start[1])
-        if dx + dy > 6:
-            self._file_lb.configure(cursor="fleur")
-            # 드롭 타겟 강조
-            w = self._file_lb.winfo_containing(event.x_root, event.y_root)
-            if self._widget_in(w, self._frame_a):
-                self._lbl_a.configure(bg="#C8D8F8")
-                self._lbl_b.configure(bg="#E8EEF8")
-            elif self._widget_in(w, self._frame_b):
-                self._lbl_b.configure(bg="#C8D8F8")
-                self._lbl_a.configure(bg="#E8EEF8")
-            else:
-                self._lbl_a.configure(bg="#E8EEF8")
-                self._lbl_b.configure(bg="#E8EEF8")
+    def _on_lb_motion(self, event: tk.Event) -> str:
+        # "break" 를 반환해 Listbox 기본 드래그 범위 선택을 항상 차단한다.
+        # Ctrl/Shift 클릭 선택은 <ButtonPress-1> 에서 처리되므로 영향 없음.
+        if self._drag_idx is not None and self._drag_start is not None:
+            dx = abs(event.x_root - self._drag_start[0])
+            dy = abs(event.y_root - self._drag_start[1])
+            if dx + dy > 6:
+                self._file_lb.configure(cursor="fleur")
+                # 드롭 타겟 강조
+                w = self._file_lb.winfo_containing(event.x_root, event.y_root)
+                if self._widget_in(w, self._frame_a):
+                    self._lbl_a.configure(bg="#C8D8F8")
+                    self._lbl_b.configure(bg="#E8EEF8")
+                elif self._widget_in(w, self._frame_b):
+                    self._lbl_b.configure(bg="#C8D8F8")
+                    self._lbl_a.configure(bg="#E8EEF8")
+                else:
+                    self._lbl_a.configure(bg="#E8EEF8")
+                    self._lbl_b.configure(bg="#E8EEF8")
+        return "break"  # 드래그 범위 선택 차단
 
     def _on_lb_release(self, event: tk.Event) -> None:
         self._file_lb.configure(cursor="")
