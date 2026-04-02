@@ -8,6 +8,22 @@ from typing import Dict, List, Tuple
 
 from tools.base_tool import BaseTool
 
+try:
+    from tkinterdnd2 import DND_FILES
+    _HAS_DND = True
+except ImportError:
+    _HAS_DND = False
+
+
+def _parse_drop_data(data: str) -> List[str]:
+    """TkinterDnD drop 이벤트 데이터를 파일 경로 리스트로 변환한다."""
+    paths = []
+    for token in re.findall(r"\{([^}]+)\}|(\S+)", data):
+        path = token[0] or token[1]
+        if path:
+            paths.append(path)
+    return paths
+
 
 def parse_apdl_variables(filepath: str) -> Dict[str, str]:
     """APDL 입력 파일에서 변수 할당을 파싱한다.
@@ -63,7 +79,7 @@ class VariableCompareTool(BaseTool):
 
     # ── UI 구성 ──────────────────────────────────────
 
-    def build_ui(self, parent: tk.Frame) -> None:
+    def build_ui(self, parent: tk.Frame) -> None:  # noqa: C901
         self._files: List[str] = []
         self._all_vars: Dict[str, Dict[str, str]] = {}  # {filepath: {var: val}}
 
@@ -83,15 +99,27 @@ class VariableCompareTool(BaseTool):
             side="top", fill="x"
         )
 
-        self._file_listbox = tk.Listbox(
-            top, height=5, selectmode="extended", activestyle="none"
+        list_container = ttk.Frame(top)
+        list_container.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        dnd_hint = "  (드래그 앤 드롭 지원)" if _HAS_DND else ""
+        ttk.Label(list_container, text=f"파일 목록{dnd_hint}", foreground="#555").pack(
+            anchor="w"
         )
-        self._file_listbox.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        self._file_listbox = tk.Listbox(
+            list_container, height=5, selectmode="extended", activestyle="none"
+        )
+        self._file_listbox.pack(side="left", fill="both", expand=True)
         file_scroll = ttk.Scrollbar(
-            top, orient="vertical", command=self._file_listbox.yview
+            list_container, orient="vertical", command=self._file_listbox.yview
         )
         file_scroll.pack(side="left", fill="y")
         self._file_listbox.configure(yscrollcommand=file_scroll.set)
+
+        if _HAS_DND:
+            self._file_listbox.drop_target_register(DND_FILES)
+            self._file_listbox.dnd_bind("<<Drop>>", self._on_drop)
 
         # 중단: 필터 + 비교 버튼
         mid = ttk.Frame(parent)
@@ -143,8 +171,15 @@ class VariableCompareTool(BaseTool):
 
     def _add_files(self) -> None:
         paths = filedialog.askopenfilenames(filetypes=self._FILETYPES)
+        self._load_paths(list(paths))
+
+    def _on_drop(self, event) -> None:
+        """드래그 앤 드롭으로 파일을 추가한다."""
+        self._load_paths(_parse_drop_data(event.data))
+
+    def _load_paths(self, paths: List[str]) -> None:
         for p in paths:
-            if p not in self._files:
+            if os.path.isfile(p) and p not in self._files:
                 self._files.append(p)
                 self._file_listbox.insert("end", os.path.basename(p))
         self._status_var.set(f"파일 {len(self._files)}개 로드됨")
