@@ -7,6 +7,7 @@ from tkinter import ttk, filedialog
 from typing import Dict, List, Tuple
 
 from tools.base_tool import BaseTool
+from tools._dnd_helper import has_dnd, register_drop_target
 
 
 def parse_apdl_variables(filepath: str) -> Dict[str, str]:
@@ -63,7 +64,7 @@ class VariableCompareTool(BaseTool):
 
     # ── UI 구성 ──────────────────────────────────────
 
-    def build_ui(self, parent: tk.Frame) -> None:
+    def build_ui(self, parent: tk.Frame) -> None:  # noqa: C901
         self._files: List[str] = []
         self._all_vars: Dict[str, Dict[str, str]] = {}  # {filepath: {var: val}}
 
@@ -83,15 +84,26 @@ class VariableCompareTool(BaseTool):
             side="top", fill="x"
         )
 
-        self._file_listbox = tk.Listbox(
-            top, height=5, selectmode="extended", activestyle="none"
+        list_container = ttk.Frame(top)
+        list_container.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        dnd_hint = "  (드래그 앤 드롭 지원)" if has_dnd() else ""
+        ttk.Label(list_container, text=f"파일 목록{dnd_hint}", foreground="#555").pack(
+            anchor="w"
         )
-        self._file_listbox.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        self._file_listbox = tk.Listbox(
+            list_container, height=5, selectmode="extended", activestyle="none"
+        )
+        self._file_listbox.pack(side="left", fill="both", expand=True)
         file_scroll = ttk.Scrollbar(
-            top, orient="vertical", command=self._file_listbox.yview
+            list_container, orient="vertical", command=self._file_listbox.yview
         )
         file_scroll.pack(side="left", fill="y")
         self._file_listbox.configure(yscrollcommand=file_scroll.set)
+
+        if has_dnd():
+            register_drop_target(self._file_listbox, self._load_paths)
 
         # 중단: 필터 + 비교 버튼
         mid = ttk.Frame(parent)
@@ -143,8 +155,11 @@ class VariableCompareTool(BaseTool):
 
     def _add_files(self) -> None:
         paths = filedialog.askopenfilenames(filetypes=self._FILETYPES)
+        self._load_paths(list(paths))
+
+    def _load_paths(self, paths: List[str]) -> None:
         for p in paths:
-            if p not in self._files:
+            if os.path.isfile(p) and p not in self._files:
                 self._files.append(p)
                 self._file_listbox.insert("end", os.path.basename(p))
         self._status_var.set(f"파일 {len(self._files)}개 로드됨")

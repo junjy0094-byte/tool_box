@@ -30,17 +30,28 @@ _enable_dpi_awareness()
 # ── 등록할 도구 목록 ─────────────────────────────
 from tools.screenshot_tool import ScreenshotTool
 from tools.variable_compare_tool import VariableCompareTool
+from tools.file_compare_tool import FileCompareTool
 
 TOOLS = [
     ScreenshotTool,
     VariableCompareTool,
+    FileCompareTool,
     # 새 도구 클래스를 여기에 추가하세요.
 ]
 # ─────────────────────────────────────────────────
 
+# tkinterdnd2 가 있으면 TkinterDnD.Tk() 를 루트로 사용해야 DnD 가 동작한다.
+# Windows 포함 모든 플랫폼에서 동일하게 적용한다.
+def _make_root() -> tk.Tk:
+    try:
+        from tkinterdnd2 import TkinterDnD  # type: ignore
+        return TkinterDnD.Tk()
+    except Exception:
+        return tk.Tk()
+
 
 def main() -> None:
-    root = tk.Tk()
+    root = _make_root()
     root.title("Tool Box")
     root.geometry("800x600")
     root.minsize(600, 400)
