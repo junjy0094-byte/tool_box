@@ -80,18 +80,20 @@ class FileCompareTool(BaseTool):
         self._group_map: Optional[Dict[str, int]] = None
 
         # ── 전체를 상하 PanedWindow 로 구성 (파일 목록 높이 조절 가능) ────────
-        main_pw = ttk.PanedWindow(parent, orient="vertical")
+        # tk.PanedWindow 사용: sash 가 눈에 보이고 잡기 쉬움
+        main_pw = tk.PanedWindow(
+            parent, orient="vertical",
+            sashwidth=6, sashrelief="raised", bg="#C0C0C0",
+            showhandle=False,
+        )
         main_pw.pack(fill="both", expand=True, padx=6, pady=6)
 
         # ── 상단: 파일 목록 ──────────────────────────────────────────────────
-        top_frame = ttk.Frame(main_pw)
-        main_pw.add(top_frame, weight=0)
-
         list_lf = ttk.LabelFrame(
-            top_frame,
+            main_pw,
             text="파일 목록" + ("  (외부 파일 드래그 앤 드롭 지원)" if has_dnd() else ""),
         )
-        list_lf.pack(fill="both", expand=True)
+        main_pw.add(list_lf, minsize=80, height=160)
 
         btn_row = ttk.Frame(list_lf)
         btn_row.pack(fill="x", padx=4, pady=(4, 2))
@@ -114,7 +116,7 @@ class FileCompareTool(BaseTool):
 
         # 파일 리스트박스
         lb_row = ttk.Frame(list_lf)
-        lb_row.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        lb_row.pack(fill="both", expand=True, padx=4, pady=(0, 2))
 
         self._file_lb = tk.Listbox(
             lb_row, height=5, selectmode="extended", activestyle="none",
@@ -135,19 +137,16 @@ class FileCompareTool(BaseTool):
         self._summary_var = tk.StringVar(
             value="파일을 추가하고 '동일/다름 판단' 버튼을 누르세요."
         )
-        ttk.Label(top_frame, textvariable=self._summary_var, anchor="w").pack(
+        ttk.Label(list_lf, textvariable=self._summary_var, anchor="w").pack(
             fill="x", padx=10, pady=(0, 2)
         )
 
         # ── 하단: 상세 비교 ──────────────────────────────────────────────────
-        bottom_frame = ttk.Frame(main_pw)
-        main_pw.add(bottom_frame, weight=1)
-
         detail_lf = ttk.LabelFrame(
-            bottom_frame,
+            main_pw,
             text="상세 비교  ─  파일 2개를 Ctrl+클릭 선택 후 '상세 비교' 클릭",
         )
-        detail_lf.pack(fill="both", expand=True)
+        main_pw.add(detail_lf, minsize=120)
 
         sel_row = ttk.Frame(detail_lf)
         sel_row.pack(fill="x", padx=4, pady=(4, 2))
