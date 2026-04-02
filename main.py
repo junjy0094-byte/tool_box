@@ -29,9 +29,11 @@ _enable_dpi_awareness()
 
 # ── 등록할 도구 목록 ─────────────────────────────
 from tools.screenshot_tool import ScreenshotTool
+from tools.variable_compare_tool import VariableCompareTool
 
 TOOLS = [
     ScreenshotTool,
+    VariableCompareTool,
     # 새 도구 클래스를 여기에 추가하세요.
 ]
 # ─────────────────────────────────────────────────
@@ -40,8 +42,8 @@ TOOLS = [
 def main() -> None:
     root = tk.Tk()
     root.title("Tool Box")
-    root.geometry("420x280")
-    root.minsize(360, 240)
+    root.geometry("800x600")
+    root.minsize(600, 400)
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
