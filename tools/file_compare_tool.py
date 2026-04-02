@@ -78,16 +78,20 @@ class FileCompareTool(BaseTool):
         self._files: List[str] = []
         # 마지막 similarity 결과: {filepath: gid}  /  None = 미실행
         self._group_map: Optional[Dict[str, int]] = None
-        # 내부 드래그 추적
-        self._drag_idx: Optional[int] = None
-        self._drag_start: Optional[Tuple[int, int]] = None
+
+        # ── 전체를 상하 PanedWindow 로 구성 (파일 목록 높이 조절 가능) ────────
+        main_pw = ttk.PanedWindow(parent, orient="vertical")
+        main_pw.pack(fill="both", expand=True, padx=6, pady=6)
 
         # ── 상단: 파일 목록 ──────────────────────────────────────────────────
+        top_frame = ttk.Frame(main_pw)
+        main_pw.add(top_frame, weight=0)
+
         list_lf = ttk.LabelFrame(
-            parent,
+            top_frame,
             text="파일 목록" + ("  (외부 파일 드래그 앤 드롭 지원)" if has_dnd() else ""),
         )
-        list_lf.pack(fill="x", padx=6, pady=(6, 2))
+        list_lf.pack(fill="both", expand=True)
 
         btn_row = ttk.Frame(list_lf)
         btn_row.pack(fill="x", padx=4, pady=(4, 2))
@@ -124,11 +128,6 @@ class FileCompareTool(BaseTool):
         if has_dnd():
             register_drop_target(self._file_lb, self._load_paths)
 
-        # 내부 드래그 (목록 → A/B 패널) + 드래그 범위 선택 차단
-        self._file_lb.bind("<ButtonPress-1>",  self._on_lb_press)
-        self._file_lb.bind("<B1-Motion>",       self._on_lb_motion)
-        self._file_lb.bind("<ButtonRelease-1>", self._on_lb_release)
-
         # 우클릭 컨텍스트 메뉴 (외부 편집기에서 열기)
         self._file_lb.bind("<Button-3>", self._on_lb_right_click)
 
@@ -136,18 +135,19 @@ class FileCompareTool(BaseTool):
         self._summary_var = tk.StringVar(
             value="파일을 추가하고 '동일/다름 판단' 버튼을 누르세요."
         )
-        ttk.Label(parent, textvariable=self._summary_var, anchor="w").pack(
+        ttk.Label(top_frame, textvariable=self._summary_var, anchor="w").pack(
             fill="x", padx=10, pady=(0, 2)
         )
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=6, pady=3)
-
         # ── 하단: 상세 비교 ──────────────────────────────────────────────────
+        bottom_frame = ttk.Frame(main_pw)
+        main_pw.add(bottom_frame, weight=1)
+
         detail_lf = ttk.LabelFrame(
-            parent,
-            text="상세 비교  ─  위 목록에서 아래 A·B 영역으로 드래그하여 파일 지정",
+            bottom_frame,
+            text="상세 비교  ─  파일 2개를 Ctrl+클릭 선택 후 '상세 비교' 클릭",
         )
-        detail_lf.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        detail_lf.pack(fill="both", expand=True)
 
         sel_row = ttk.Frame(detail_lf)
         sel_row.pack(fill="x", padx=4, pady=(4, 2))
@@ -175,10 +175,10 @@ class FileCompareTool(BaseTool):
         diff_pw.add(self._frame_a, weight=1)
         diff_pw.add(self._frame_b, weight=1)
 
-        # 각 패널의 드롭 헤더 레이블 (드래그 힌트 겸 드롭 타겟)
+        # 각 패널의 헤더 레이블
         self._lbl_a = tk.Label(
             self._frame_a,
-            text="[ 파일 A ]  ← 위 목록에서 드래그",
+            text="[ 파일 A ]",
             anchor="w", bg="#E8EEF8", fg="#336",
             relief="groove", padx=4,
         )
@@ -186,7 +186,7 @@ class FileCompareTool(BaseTool):
 
         self._lbl_b = tk.Label(
             self._frame_b,
-            text="[ 파일 B ]  ← 위 목록에서 드래그",
+            text="[ 파일 B ]",
             anchor="w", bg="#E8EEF8", fg="#336",
             relief="groove", padx=4,
         )
@@ -205,7 +205,9 @@ class FileCompareTool(BaseTool):
         frame.pack(fill="both", expand=True)
 
         txt = tk.Text(frame, wrap="none", state="disabled",
-                      font=("Consolas", 9), relief="flat")
+                      font=("Consolas", 9), relief="flat",
+                      selectbackground="#3366CC", selectforeground="#FFFFFF",
+                      inactiveselectbackground="#3366CC")
         if side == "left":
             self._vsb_a = ttk.Scrollbar(frame, orient="vertical")
             self._hsb_a = ttk.Scrollbar(frame, orient="horizontal", command=txt.xview)
@@ -441,75 +443,7 @@ class FileCompareTool(BaseTool):
         ttk.Button(btn_f, text="덮어쓰기 실행", command=do_sync).pack(side="left", padx=8)
         ttk.Button(btn_f, text="취소", command=dlg.destroy).pack(side="left")
 
-    # ── 내부 드래그 (리스트박스 → A/B 패널) ──────────────────────────────────
-
-    def _on_lb_press(self, event: tk.Event) -> None:
-        idx = self._file_lb.nearest(event.y)
-        if 0 <= idx < len(self._files):
-            self._drag_idx = idx
-            self._drag_start = (event.x_root, event.y_root)
-        else:
-            self._drag_idx = None
-
-    def _on_lb_motion(self, event: tk.Event) -> str:
-        # "break" 를 반환해 Listbox 기본 드래그 범위 선택을 항상 차단한다.
-        # Ctrl/Shift 클릭 선택은 <ButtonPress-1> 에서 처리되므로 영향 없음.
-        if self._drag_idx is not None and self._drag_start is not None:
-            dx = abs(event.x_root - self._drag_start[0])
-            dy = abs(event.y_root - self._drag_start[1])
-            if dx + dy > 6:
-                self._file_lb.configure(cursor="fleur")
-                # 드롭 타겟 강조
-                w = self._file_lb.winfo_containing(event.x_root, event.y_root)
-                if self._widget_in(w, self._frame_a):
-                    self._lbl_a.configure(bg="#C8D8F8")
-                    self._lbl_b.configure(bg="#E8EEF8")
-                elif self._widget_in(w, self._frame_b):
-                    self._lbl_b.configure(bg="#C8D8F8")
-                    self._lbl_a.configure(bg="#E8EEF8")
-                else:
-                    self._lbl_a.configure(bg="#E8EEF8")
-                    self._lbl_b.configure(bg="#E8EEF8")
-        return "break"  # 드래그 범위 선택 차단
-
-    def _on_lb_release(self, event: tk.Event) -> None:
-        self._file_lb.configure(cursor="")
-        self._lbl_a.configure(bg="#E8EEF8")
-        self._lbl_b.configure(bg="#E8EEF8")
-
-        if self._drag_idx is None or self._drag_start is None:
-            return
-
-        dx = abs(event.x_root - self._drag_start[0])
-        dy = abs(event.y_root - self._drag_start[1])
-        dragged = dx + dy > 6
-
-        self._drag_start = None
-        idx = self._drag_idx
-        self._drag_idx = None
-
-        if not dragged:
-            return
-
-        w = self._file_lb.winfo_containing(event.x_root, event.y_root)
-        names = self._short_names()
-        if 0 <= idx < len(names):
-            if self._widget_in(w, self._frame_a):
-                self._set_diff_file("a", idx)
-            elif self._widget_in(w, self._frame_b):
-                self._set_diff_file("b", idx)
-
-    def _widget_in(self, widget, frame) -> bool:
-        """widget 이 frame 의 자손(또는 자기 자신)이면 True."""
-        w = widget
-        while w is not None:
-            if w == frame:
-                return True
-            try:
-                w = w.master
-            except Exception:
-                return False
-        return False
+    # ── 우클릭 메뉴 / 외부 편집기 ───────────────────────────────────────────
 
     def _on_lb_right_click(self, event: tk.Event) -> None:
         """리스트박스 우클릭 시 컨텍스트 메뉴를 표시한다."""
@@ -552,19 +486,6 @@ class FileCompareTool(BaseTool):
         for i in self._file_lb.curselection():
             if 0 <= i < len(self._files):
                 self._open_in_editor(self._files[i])
-
-    def _set_diff_file(self, panel: str, idx: int) -> None:
-        names = self._short_names()
-        name = names[idx]
-        if panel == "a":
-            self._combo_a.set(name)
-            self._lbl_a.configure(text=f"[ 파일 A ]  {name}")
-        else:
-            self._combo_b.set(name)
-            self._lbl_b.configure(text=f"[ 파일 B ]  {name}")
-        # 양쪽 모두 지정됐으면 즉시 비교
-        if self._combo_a.get() and self._combo_b.get():
-            self._do_diff()
 
     # ── 상세 비교 ─────────────────────────────────────────────────────────────
 
