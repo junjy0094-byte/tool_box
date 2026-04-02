@@ -102,7 +102,9 @@ class FileCompareTool(BaseTool):
 
         if _HAS_DND:
             self._file_lb.drop_target_register(DND_FILES)
-            self._file_lb.dnd_bind("<<Drop>>", self._on_list_drop)
+            self._file_lb.dnd_bind("<<DropEnter>>",    lambda e: "copy")
+            self._file_lb.dnd_bind("<<DropPosition>>", lambda e: "copy")
+            self._file_lb.dnd_bind("<<Drop>>",         self._on_list_drop)
 
         # 요약 레이블
         self._summary_var = tk.StringVar(
@@ -217,8 +219,13 @@ class FileCompareTool(BaseTool):
         paths = filedialog.askopenfilenames(filetypes=self._FILETYPES)
         self._load_paths(list(paths))
 
-    def _on_list_drop(self, event) -> None:
-        self._load_paths(_parse_drop_data(event.data))
+    def _on_list_drop(self, event) -> str:
+        try:
+            files = event.widget.tk.splitlist(event.data)
+        except Exception:
+            files = _parse_drop_data(event.data)
+        self._load_paths(list(files))
+        return event.action
 
     def _load_paths(self, paths: List[str]) -> None:
         for p in paths:

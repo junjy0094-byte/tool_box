@@ -119,7 +119,9 @@ class VariableCompareTool(BaseTool):
 
         if _HAS_DND:
             self._file_listbox.drop_target_register(DND_FILES)
-            self._file_listbox.dnd_bind("<<Drop>>", self._on_drop)
+            self._file_listbox.dnd_bind("<<DropEnter>>",    lambda e: "copy")
+            self._file_listbox.dnd_bind("<<DropPosition>>", lambda e: "copy")
+            self._file_listbox.dnd_bind("<<Drop>>",         self._on_drop)
 
         # 중단: 필터 + 비교 버튼
         mid = ttk.Frame(parent)
@@ -173,9 +175,14 @@ class VariableCompareTool(BaseTool):
         paths = filedialog.askopenfilenames(filetypes=self._FILETYPES)
         self._load_paths(list(paths))
 
-    def _on_drop(self, event) -> None:
+    def _on_drop(self, event) -> str:
         """드래그 앤 드롭으로 파일을 추가한다."""
-        self._load_paths(_parse_drop_data(event.data))
+        try:
+            files = event.widget.tk.splitlist(event.data)
+        except Exception:
+            files = _parse_drop_data(event.data)
+        self._load_paths(list(files))
+        return event.action
 
     def _load_paths(self, paths: List[str]) -> None:
         for p in paths:
