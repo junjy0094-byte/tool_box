@@ -80,11 +80,10 @@ class FileCompareTool(BaseTool):
         self._group_map: Optional[Dict[str, int]] = None
 
         # ── 전체를 상하 PanedWindow 로 구성 (파일 목록 높이 조절 가능) ────────
-        # tk.PanedWindow 사용: sash 가 눈에 보이고 잡기 쉬움
         main_pw = tk.PanedWindow(
-            parent, orient="vertical",
-            sashwidth=6, sashrelief="raised", bg="#C0C0C0",
-            showhandle=False,
+            parent, orient="vertical", borderwidth=0,
+            sashwidth=4, sashrelief="flat", sashpad=0,
+            showhandle=False, opaqueresize=True,
         )
         main_pw.pack(fill="both", expand=True, padx=6, pady=6)
 
@@ -380,7 +379,8 @@ class FileCompareTool(BaseTool):
 
         tgt_frame = ttk.Frame(dlg)
         tgt_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
-        tgt_lb = tk.Listbox(tgt_frame, selectmode="extended", height=8, width=52)
+        tgt_lb = tk.Listbox(tgt_frame, selectmode="extended", height=8, width=52,
+                            exportselection=False)
         tgt_sb = ttk.Scrollbar(tgt_frame, orient="vertical", command=tgt_lb.yview)
         tgt_lb.configure(yscrollcommand=tgt_sb.set)
         tgt_lb.pack(side="left", fill="both", expand=True)

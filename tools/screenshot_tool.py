@@ -180,7 +180,15 @@ class ScreenshotTool(BaseTool):
 
         # ── 상태 표시줄 ──
         self.status_label = ttk.Label(parent, text="", foreground="gray")
-        self.status_label.pack(padx=10, pady=(0, 10))
+        self.status_label.pack(padx=10, pady=(0, 5))
+
+        # ── 이미지 미리보기 ──
+        preview_lf = ttk.LabelFrame(parent, text="미리보기")
+        preview_lf.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self._preview_label = ttk.Label(preview_lf, anchor="center")
+        self._preview_label.pack(fill="both", expand=True, padx=4, pady=4)
+        self._preview_photo = None  # PhotoImage 참조 유지용
 
     def _coord_text(self) -> str:
         if self.bbox:
@@ -240,4 +248,25 @@ class ScreenshotTool(BaseTool):
         display_pct = int(self.scale * 100)
         self.status_label.config(
             text=f"✓ 클립보드 복사 ({w}×{h}px, 표시 {display_pct}%)"
+        )
+        self._show_preview(img)
+
+    def _show_preview(self, img: Image.Image) -> None:
+        """캡처된 이미지를 미리보기 영역에 축소하여 표시한다."""
+        self._preview_label.update_idletasks()
+        max_w = max(self._preview_label.winfo_width(), 200)
+        max_h = max(self._preview_label.winfo_height(), 150)
+
+        img_w, img_h = img.size
+        ratio = min(max_w / img_w, max_h / img_h, 1.0)
+        new_w = max(1, int(img_w * ratio))
+        new_h = max(1, int(img_h * ratio))
+        thumb = img.resize((new_w, new_h), Image.LANCZOS)
+
+        from PIL import ImageTk
+        self._preview_photo = ImageTk.PhotoImage(thumb)
+        self._preview_label.config(
+            image=self._preview_photo,
+            text=f"  {img_w}×{img_h}px → 표시 {int(self.scale*100)}%  ",
+            compound="top",
         )
