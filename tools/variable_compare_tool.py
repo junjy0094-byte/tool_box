@@ -68,36 +68,29 @@ class VariableCompareTool(BaseTool):
         self._files: List[str] = []
         self._all_vars: Dict[str, Dict[str, str]] = {}  # {filepath: {var: val}}
 
-        # 상단: 파일 목록 + 버튼
-        top = ttk.Frame(parent)
-        top.pack(fill="x", padx=6, pady=(6, 2))
+        # ── 상단: 파일 목록 ──────────────────────────────────────────────────
+        list_lf = ttk.LabelFrame(
+            parent,
+            text="파일 목록" + ("  (외부 파일 드래그 앤 드롭 지원)" if has_dnd() else ""),
+        )
+        list_lf.pack(fill="x", padx=6, pady=(6, 2))
 
-        btn_frame = ttk.Frame(top)
-        btn_frame.pack(side="left")
-        ttk.Button(btn_frame, text="파일 추가", command=self._add_files).pack(
-            side="top", fill="x", pady=(0, 2)
-        )
-        ttk.Button(btn_frame, text="선택 제거", command=self._remove_selected).pack(
-            side="top", fill="x", pady=(0, 2)
-        )
-        ttk.Button(btn_frame, text="전체 제거", command=self._clear_files).pack(
-            side="top", fill="x"
-        )
+        btn_row = ttk.Frame(list_lf)
+        btn_row.pack(fill="x", padx=4, pady=(4, 2))
 
-        list_container = ttk.Frame(top)
-        list_container.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        ttk.Button(btn_row, text="파일 추가", command=self._add_files).pack(side="left", padx=(0, 3))
+        ttk.Button(btn_row, text="선택 제거", command=self._remove_selected).pack(side="left", padx=(0, 3))
+        ttk.Button(btn_row, text="전체 제거", command=self._clear_files).pack(side="left")
 
-        dnd_hint = "  (드래그 앤 드롭 지원)" if has_dnd() else ""
-        ttk.Label(list_container, text=f"파일 목록{dnd_hint}", foreground="#555").pack(
-            anchor="w"
-        )
+        lb_row = ttk.Frame(list_lf)
+        lb_row.pack(fill="x", padx=4, pady=(0, 4))
 
         self._file_listbox = tk.Listbox(
-            list_container, height=5, selectmode="extended", activestyle="none"
+            lb_row, height=5, selectmode="extended", activestyle="none"
         )
         self._file_listbox.pack(side="left", fill="both", expand=True)
         file_scroll = ttk.Scrollbar(
-            list_container, orient="vertical", command=self._file_listbox.yview
+            lb_row, orient="vertical", command=self._file_listbox.yview
         )
         file_scroll.pack(side="left", fill="y")
         self._file_listbox.configure(yscrollcommand=file_scroll.set)
@@ -105,9 +98,11 @@ class VariableCompareTool(BaseTool):
         if has_dnd():
             register_drop_target(self._file_listbox, self._load_paths)
 
-        # 중단: 필터 + 비교 버튼
+        # ── 중단: 필터 + 비교 버튼 ──────────────────────────────────────────
         mid = ttk.Frame(parent)
         mid.pack(fill="x", padx=6, pady=4)
+
+        ttk.Button(mid, text="비교", command=self._compare).pack(side="left", padx=(0, 8))
 
         ttk.Label(mid, text="변수 필터:").pack(side="left")
         self._filter_var = tk.StringVar()
@@ -120,9 +115,7 @@ class VariableCompareTool(BaseTool):
         ttk.Checkbutton(
             mid, text="차이만 표시", variable=self._diff_only_var,
             command=self._apply_filter,
-        ).pack(side="left", padx=(0, 8))
-
-        ttk.Button(mid, text="비교", command=self._compare).pack(side="left")
+        ).pack(side="left")
 
         # 하단: 비교 결과 테이블
         table_frame = ttk.Frame(parent)
