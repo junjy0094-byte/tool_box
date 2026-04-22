@@ -54,14 +54,12 @@ def parse_apdl_variables(filepath: str) -> Dict[str, str]:
 class VariableCompareTool(BaseTool):
     """여러 ANSYS APDL 입력 파일의 변수를 비교하는 도구."""
 
+    name = "변수 비교"
+
     _FILETYPES = [
         ("APDL 파일", "*.txt *.inp *.ans *.mac *.dat *.cdb"),
         ("모든 파일", "*.*"),
     ]
-
-    @property
-    def name(self) -> str:
-        return "변수 비교"
 
     # ── UI 구성 ──────────────────────────────────────
 

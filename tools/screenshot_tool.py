@@ -124,6 +124,7 @@ def _copy_image_to_clipboard(img: Image.Image, scale: float) -> None:
 
 class ScreenshotTool(BaseTool):
     name = "스크린샷"
+    default_geometry = "520x620"
 
     def __init__(self):
         cfg = get_tool_config(TOOL_NAME)
