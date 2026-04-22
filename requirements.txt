@@ -6,3 +6,4 @@ numpy
 matplotlib
 shapely
 pcb-tools
+pandas

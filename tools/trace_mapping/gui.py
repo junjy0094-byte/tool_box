@@ -20,6 +20,9 @@ from .process import (process_layers, collect_art_files,
                       load_cached_mappers, CacheMissError)
 from .plot import plot_comparison
 from .cache import CACHE_DIRNAME
+from .postprocess import (read_region_and_round, iter_target_csvs,
+                          output_path_for, count_comment_lines,
+                          count_csv_rows)
 
 
 class _LogWriter:
@@ -234,7 +237,7 @@ def build_gui(parent):
 
     # ---- Run button ----
     run_frame = tk.Frame(parent)
-    run_frame.pack(fill='x', padx=8, pady=(0, 8))
+    run_frame.pack(fill='x', padx=8, pady=(0, 2))
 
     def run_processing():
         paths = list(file_listbox.get(0, tk.END))
@@ -470,6 +473,109 @@ def build_gui(parent):
                     log(f"  Failed to remove {c}: {e}\n")
         log(f"Cleared cache in {removed} location(s)\n")
 
+    # ---- Post-processing (rounded table export) ----
+    def run_postprocess():
+        """Run CSV 결과를 (edge 수 만큼 잘라) N 격자 스냅 → *_rounded.txt 생성.
+
+        - input_dir: Output Directory 가 지정돼 있으면 그 경로.
+          비어 있으면 파일 목록에 있는 각 Gerber 파일의 상위 디렉터리.
+        - row_range / col_range: Custom Grid 의 Y / X coords CSV 데이터 개수.
+        - n: 'Rounding N' 입력값 (기본 100).
+        - skiprows: 각 CSV 파일의 선두 '#' 주석 줄 수를 자동 감지.
+        """
+        x_csv = x_csv_var.get().strip()
+        y_csv = y_csv_var.get().strip()
+        if not x_csv or not y_csv:
+            messagebox.showerror(
+                "Custom Grid 필요",
+                "후처리는 Custom Grid 의 X coords CSV 와 Y coords CSV 가 "
+                "모두 설정되어 있어야 합니다.")
+            return
+        if not Path(x_csv).is_file() or not Path(y_csv).is_file():
+            messagebox.showerror(
+                "파일 없음",
+                "X / Y coords CSV 경로가 올바른 파일을 가리키지 않습니다.")
+            return
+
+        try:
+            y_len = count_csv_rows(y_csv)
+            x_len = count_csv_rows(x_csv)
+        except Exception as e:
+            messagebox.showerror("CSV 읽기 오류", str(e))
+            return
+        if y_len < 2 or x_len < 2:
+            messagebox.showerror(
+                "데이터 개수 오류",
+                f"X/Y coords CSV 의 데이터 개수가 부족합니다. "
+                f"(Y={y_len}, X={x_len})")
+            return
+
+        try:
+            n = int(n_var.get())
+            if n < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid N", "Rounding N 은 1 이상의 정수여야 합니다.")
+            return
+
+        outdir = outdir_var.get().strip()
+        if outdir:
+            input_dirs = [outdir]
+        else:
+            gerber_paths = list(file_listbox.get(0, tk.END))
+            input_dirs = sorted({
+                str(Path(p)) if Path(p).is_dir() else str(Path(p).parent)
+                for p in gerber_paths
+            })
+        if not input_dirs:
+            messagebox.showerror(
+                "입력 경로 없음",
+                "후처리 대상 CSV 가 있는 폴더를 찾을 수 없습니다. "
+                "Output Directory 를 지정하거나 Gerber 파일을 추가하세요.")
+            return
+
+        targets = iter_target_csvs(input_dirs, exclude=(x_csv, y_csv))
+        if not targets:
+            messagebox.showwarning(
+                "CSV 없음",
+                "대상 폴더에서 처리할 CSV 를 찾지 못했습니다.\n"
+                "(이미 *_rounded.csv 이거나 X/Y coords CSV 는 제외됩니다)")
+            return
+
+        postproc_btn.config(state='disabled')
+
+        def worker():
+            import traceback
+            ok = 0
+            fail = 0
+            log(f"\n=== Post-process (N={n}, "
+                f"rows={y_len}, cols={x_len}) ===\n")
+            for csv_file in targets:
+                out_path = output_path_for(csv_file, suffix="_rounded.txt")
+                skiprows = count_comment_lines(csv_file)
+                try:
+                    rounded = read_region_and_round(
+                        csv_path=csv_file,
+                        row_range=(0, y_len),
+                        col_range=(0, x_len),
+                        n=n,
+                        skiprows=skiprows,
+                        output_path=out_path,
+                    )
+                    log(f"[OK]  {Path(csv_file).name} -> "
+                        f"{Path(out_path).name}  "
+                        f"shape={rounded.shape}  (skiprows={skiprows})\n")
+                    ok += 1
+                except Exception as e:
+                    log(f"[ERR] {Path(csv_file).name}: {e}\n")
+                    log(traceback.format_exc())
+                    fail += 1
+            log(f"Post-process done. OK={ok}, FAIL={fail}\n")
+            parent.after(0, lambda: postproc_btn.config(state='normal'))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     run_btn = ttk.Button(run_frame, text="Run", command=run_processing)
     run_btn.pack(side='left', padx=4)
     ttk.Button(run_frame, text="Show Saved Plot",
@@ -479,6 +585,26 @@ def build_gui(parent):
     ttk.Button(run_frame, text="Close",
                command=lambda: parent.winfo_toplevel().destroy()).pack(
         side='right', padx=4)
+
+    # ---- Post-process row ----
+    post_frame = ttk.LabelFrame(
+        parent,
+        text="Post-process (CSV → rounded APDL table)")
+    post_frame.pack(fill='x', padx=8, pady=(2, 8))
+
+    ttk.Label(post_frame, text="Rounding N:").pack(
+        side='left', padx=(8, 2), pady=4)
+    n_var = tk.StringVar(value="100")
+    ttk.Entry(post_frame, textvariable=n_var, width=8).pack(
+        side='left', padx=(0, 8), pady=4)
+    ttk.Label(
+        post_frame,
+        text="(0~1 값을 1/N 격자로 스냅; row/col 개수는 Y/X coords CSV 에서 감지)",
+        foreground="gray",
+    ).pack(side='left', padx=(0, 8), pady=4)
+    postproc_btn = ttk.Button(
+        post_frame, text="Run Post-process", command=run_postprocess)
+    postproc_btn.pack(side='right', padx=6, pady=4)
 
 
 def gui_main():
