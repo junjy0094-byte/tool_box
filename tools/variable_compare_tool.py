@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 
 from tools.base_tool import BaseTool
 from tools._dnd_helper import has_dnd, register_drop_target
+from tools.file_compare_tool import _path_tail
 
 
 def parse_apdl_variables(filepath: str) -> Dict[str, str]:
@@ -82,6 +83,16 @@ class VariableCompareTool(BaseTool):
         ttk.Button(btn_row, text="선택 제거", command=self._remove_selected).pack(side="left", padx=(0, 3))
         ttk.Button(btn_row, text="전체 제거", command=self._clear_files).pack(side="left")
 
+        # 경로 깊이 설정 (우측)
+        ttk.Label(btn_row, text="경로 깊이:").pack(side="right")
+        self._depth_var = tk.IntVar(value=3)
+        depth_sb = ttk.Spinbox(
+            btn_row, from_=1, to=8, width=3, textvariable=self._depth_var,
+            command=self._on_depth_changed,
+        )
+        depth_sb.pack(side="right", padx=(0, 4))
+        depth_sb.bind("<Return>", lambda _e: self._on_depth_changed())
+
         lb_row = ttk.Frame(list_lf)
         lb_row.pack(fill="x", padx=4, pady=(0, 4))
 
@@ -154,7 +165,7 @@ class VariableCompareTool(BaseTool):
         for p in paths:
             if os.path.isfile(p) and p not in self._files:
                 self._files.append(p)
-                self._file_listbox.insert("end", os.path.basename(p))
+        self._refresh_listbox()
         self._status_var.set(f"파일 {len(self._files)}개 로드됨")
 
     def _remove_selected(self) -> None:
@@ -248,12 +259,18 @@ class VariableCompareTool(BaseTool):
         self._tree["columns"] = ()
 
     def _short_names(self) -> List[str]:
-        """파일 경로를 짧은 표시 이름으로 변환한다. 중복 시 상위 폴더 포함."""
-        basenames = [os.path.basename(fp) for fp in self._files]
-        if len(basenames) == len(set(basenames)):
-            return basenames
-        # 중복 파일명이 있으면 상위 디렉터리 포함
-        return [
-            os.path.join(os.path.basename(os.path.dirname(fp)), os.path.basename(fp))
-            for fp in self._files
-        ]
+        """파일 경로를 경로 깊이 설정에 따라 짧은 표시 이름으로 변환한다."""
+        depth = max(1, self._depth_var.get())
+        return [_path_tail(fp, depth) for fp in self._files]
+
+    def _refresh_listbox(self) -> None:
+        """경로 깊이에 맞춰 파일 리스트박스를 갱신한다."""
+        self._file_listbox.delete(0, "end")
+        for sn in self._short_names():
+            self._file_listbox.insert("end", sn)
+
+    def _on_depth_changed(self) -> None:
+        """경로 깊이 변경 시 리스트박스와 테이블 헤더를 갱신한다."""
+        self._refresh_listbox()
+        if hasattr(self, "_rows") and self._rows:
+            self._rebuild_table()
