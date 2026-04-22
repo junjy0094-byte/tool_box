@@ -37,11 +37,13 @@ _enable_dpi_awareness()
 from tools.screenshot_tool import ScreenshotTool
 from tools.variable_compare_tool import VariableCompareTool
 from tools.file_compare_tool import FileCompareTool
+from tools.trace_mapping import TraceMappingTool
 
 TOOLS: list[Type[BaseTool]] = [
     ScreenshotTool,
     VariableCompareTool,
     FileCompareTool,
+    TraceMappingTool,
     # 새 도구 클래스를 여기에 추가하세요.
 ]
 # ─────────────────────────────────────────────────
