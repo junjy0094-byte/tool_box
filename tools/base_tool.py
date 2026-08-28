@@ -3,12 +3,15 @@ from abc import ABC, abstractmethod
 
 
 class BaseTool(ABC):
-    """새 도구를 추가하려면 이 클래스를 상속하고 name, build_ui를 구현하세요."""
+    """새 도구를 추가하려면 이 클래스를 상속하고 name, build_ui를 구현하세요.
 
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """탭에 표시될 도구 이름"""
+    - ``name``: 런처 목록에 표시되는 도구 이름 (클래스 속성으로 지정).
+    - ``default_geometry``: 도구 창의 기본 크기(``"WxH"``). 선택 사항.
+    - ``build_ui(parent)``: parent 프레임 안에 UI를 구성.
+    """
+
+    name: str = ""
+    default_geometry: str = "900x650"
 
     @abstractmethod
     def build_ui(self, parent: tk.Frame) -> None:

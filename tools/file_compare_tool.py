@@ -63,14 +63,12 @@ def _path_tail(filepath: str, depth: int) -> str:
 class FileCompareTool(BaseTool):
     """여러 텍스트 파일을 비교하는 도구."""
 
+    name = "파일 비교"
+
     _FILETYPES = [
         ("텍스트/APDL 파일", "*.txt *.ans *.inp *.mac *.dat *.cdb *.log *.out"),
         ("모든 파일", "*.*"),
     ]
-
-    @property
-    def name(self) -> str:
-        return "파일 비교"
 
     # ── UI 구성 ───────────────────────────────────────────────────────────────
 

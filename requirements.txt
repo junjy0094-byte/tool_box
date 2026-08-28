@@ -1,3 +1,9 @@
 Pillow
 mss
 tkinterdnd2
+# Trace Mapping 도구 의존성 (해당 도구를 열 때만 필요)
+numpy
+matplotlib
+shapely
+pcb-tools
+pandas
