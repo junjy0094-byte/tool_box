@@ -172,7 +172,8 @@ class ToolLauncher:
         win = tk.Toplevel(self.root)
         win.title(getattr(instance, "name", tool_cls.__name__))
         win.geometry(getattr(instance, "default_geometry", "900x650"))
-        win.minsize(480, 360)
+        min_w, min_h = getattr(instance, "min_size", (480, 360))
+        win.minsize(min_w, min_h)
 
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True)

@@ -172,7 +172,8 @@ class StrainToCteTool(BaseTool):
     """Strain mp 코드를 붙여넣어 온도별 CTE 로 변환하는 도구."""
 
     name = "Strain → CTE 변환"
-    default_geometry = "900x720"
+    default_geometry = "980x860"
+    min_size = (820, 620)
 
     _FORMATS = [".3e", ".4e", ".6e", ".6g", ".9f"]
 
@@ -202,7 +203,7 @@ class StrainToCteTool(BaseTool):
 
         txt_row = ttk.Frame(in_lf)
         txt_row.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        self._input = tk.Text(txt_row, height=9, wrap="none", undo=True, font=mono)
+        self._input = tk.Text(txt_row, height=7, wrap="none", undo=True, font=mono)
         self._input.pack(side="left", fill="both", expand=True)
         in_vsb = ttk.Scrollbar(txt_row, orient="vertical", command=self._input.yview)
         in_vsb.pack(side="left", fill="y")
@@ -259,9 +260,25 @@ class StrainToCteTool(BaseTool):
             foreground="gray",
         ).pack(side="left")
 
+        # ── 복사 / 상태 ─────────────────────────────
+        # 창이 작아져도 잘리지 않도록 아래쪽에 먼저 고정한다.
+        # (상태 바를 먼저 pack 해야 맨 아래에 놓이고, 복사 버튼이 그 위에 온다)
+        self._status_var = tk.StringVar(
+            value="mp 코드를 붙여넣고 변환 버튼을 누르세요."
+        )
+        ttk.Label(parent, textvariable=self._status_var, anchor="w").pack(
+            side="bottom", fill="x", padx=6, pady=(0, 4)
+        )
+
+        bottom = ttk.Frame(parent)
+        bottom.pack(side="bottom", fill="x", padx=6, pady=(0, 3))
+        ttk.Button(bottom, text="표 복사", command=self._copy_table).pack(
+            side="left", padx=(0, 3)
+        )
+        ttk.Button(bottom, text="APDL 코드 복사", command=self._copy_apdl).pack(side="left")
+
         # ── 결과 ────────────────────────────────────
         nb = ttk.Notebook(parent)
-        nb.pack(fill="both", expand=True, padx=6, pady=(0, 3))
 
         table_tab = ttk.Frame(nb)
         nb.add(table_tab, text="표")
@@ -298,20 +315,9 @@ class StrainToCteTool(BaseTool):
         apdl_tab.rowconfigure(0, weight=1)
         apdl_tab.columnconfigure(0, weight=1)
 
-        # ── 복사 / 상태 ─────────────────────────────
-        bottom = ttk.Frame(parent)
-        bottom.pack(fill="x", padx=6, pady=(0, 3))
-        ttk.Button(bottom, text="표 복사", command=self._copy_table).pack(
-            side="left", padx=(0, 3)
-        )
-        ttk.Button(bottom, text="APDL 코드 복사", command=self._copy_apdl).pack(side="left")
-
-        self._status_var = tk.StringVar(
-            value="mp 코드를 붙여넣고 변환 버튼을 누르세요."
-        )
-        ttk.Label(parent, textvariable=self._status_var, anchor="w").pack(
-            fill="x", padx=6, pady=(0, 4)
-        )
+        # 노트북은 마지막에 pack 한다. pack 은 호출 순서대로 공간을 나눠주므로,
+        # 하단 복사 버튼과 상태 바가 먼저 자리를 잡은 뒤 남은 공간을 모두 차지한다.
+        nb.pack(fill="both", expand=True, padx=6, pady=(0, 3))
 
     # ── 입력 제어 ────────────────────────────────────
 
@@ -416,6 +422,7 @@ class StrainToCteTool(BaseTool):
         """
         self._canvas = None
         self._ax2 = None
+        self._auto_layout = False
 
         try:
             from matplotlib.figure import Figure
@@ -444,16 +451,32 @@ class StrainToCteTool(BaseTool):
             command=self._refresh_plot,
         ).pack(side="left")
 
-        self._fig = Figure(figsize=(7.0, 4.0), dpi=100)
+        self._fig = Figure(figsize=(7.0, 3.6), dpi=100)
+        try:
+            # 자동 레이아웃: 창 크기를 줄여도 축 라벨이 잘리지 않도록
+            # 그릴 때마다 여백을 다시 계산한다 (matplotlib 3.6+).
+            self._fig.set_layout_engine("constrained")
+            self._auto_layout = True
+        except Exception:
+            # 구버전에서는 갱신할 때 tight_layout 으로 대체한다.
+            self._auto_layout = False
         self._ax = self._fig.add_subplot(111)
         self._canvas = FigureCanvasTkAgg(self._fig, master=tab)
-        self._canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=(2, 0))
 
+        # 툴바를 캔버스보다 먼저 아래쪽에 고정한다. 캔버스만 남은 공간을
+        # 차지하므로 창을 줄여도 툴바가 잘리지 않는다.
         toolbar_frame = ttk.Frame(tab)
-        toolbar_frame.pack(fill="x", padx=4, pady=(0, 4))
+        toolbar_frame.pack(side="bottom", fill="x", padx=4, pady=(0, 4))
         NavigationToolbar2Tk(self._canvas, toolbar_frame).update()
 
+        self._canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=(2, 0))
+
         self._refresh_plot()
+
+    def _apply_layout(self) -> None:
+        """자동 레이아웃을 쓸 수 없는 matplotlib 버전에서만 여백을 정리한다."""
+        if not self._auto_layout:
+            self._fig.tight_layout()
 
     def _refresh_plot(self) -> None:
         """현재 결과로 온도-CTE 그래프를 다시 그린다."""
@@ -481,7 +504,7 @@ class StrainToCteTool(BaseTool):
                 0.5, 0.5, "No data - run the conversion first",
                 ha="center", va="center", transform=ax.transAxes, color="gray",
             )
-            self._fig.tight_layout()
+            self._apply_layout()
             self._canvas.draw_idle()
             return
 
@@ -511,7 +534,7 @@ class StrainToCteTool(BaseTool):
             title += f", {self._source_label})" if self._source_label else ")"
         ax.set_title(title, fontsize=10)
 
-        self._fig.tight_layout()
+        self._apply_layout()
         self._canvas.draw_idle()
 
     def _table_text(self) -> str:
