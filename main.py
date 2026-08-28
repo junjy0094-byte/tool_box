@@ -39,6 +39,7 @@ from tools.variable_compare_tool import VariableCompareTool
 from tools.file_compare_tool import FileCompareTool
 from tools.trace_mapping import TraceMappingTool
 from tools.strain_to_cte_tool import StrainToCteTool
+from tools.ball_map import BallMapTool
 
 TOOLS: list[Type[BaseTool]] = [
     ScreenshotTool,
@@ -46,6 +47,7 @@ TOOLS: list[Type[BaseTool]] = [
     FileCompareTool,
     TraceMappingTool,
     StrainToCteTool,
+    BallMapTool,
     # 새 도구 클래스를 여기에 추가하세요.
 ]
 # ─────────────────────────────────────────────────
