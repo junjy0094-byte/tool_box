@@ -181,6 +181,8 @@ class StrainToCteTool(BaseTool):
     def build_ui(self, parent: tk.Frame) -> None:
         self._parent = parent
         self._rows: List[Tuple[int, float, float, float]] = []  # (no, temp, strain, cte)
+        self._source_material = ""   # 그래프 제목에 표시할 입력 재료명
+        self._source_label = ""      # 입력 물성 라벨 (thsx 등)
 
         mono = ("Consolas", 10) if platform.system() == "Windows" else "TkFixedFont"
 
@@ -282,6 +284,10 @@ class StrainToCteTool(BaseTool):
         table_tab.rowconfigure(0, weight=1)
         table_tab.columnconfigure(0, weight=1)
 
+        plot_tab = ttk.Frame(nb)
+        nb.add(plot_tab, text="그래프")
+        self._build_plot_tab(plot_tab)
+
         apdl_tab = ttk.Frame(nb)
         nb.add(apdl_tab, text="APDL 코드")
         self._apdl = tk.Text(apdl_tab, wrap="none", font=mono)
@@ -358,6 +364,8 @@ class StrainToCteTool(BaseTool):
         ]
 
         # 입력에서 읽은 재료명은 APDL 출력 기본값으로 사용한다.
+        self._source_material = material
+        self._source_label = label
         if material:
             self._mat_var.set(material)
 
@@ -395,6 +403,116 @@ class StrainToCteTool(BaseTool):
 
         self._apdl.delete("1.0", "end")
         self._apdl.insert("1.0", self._apdl_text())
+
+        self._refresh_plot()
+
+    # ── 그래프 ───────────────────────────────────────
+
+    def _build_plot_tab(self, tab: ttk.Frame) -> None:
+        """온도-CTE 그래프 탭을 구성한다.
+
+        matplotlib 이 없으면 안내 문구만 표시하고 나머지 기능은 그대로 쓴다.
+        pyplot 을 쓰지 않고 Figure 를 직접 만들어, 창을 닫으면 함께 해제된다.
+        """
+        self._canvas = None
+        self._ax2 = None
+
+        try:
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import (
+                FigureCanvasTkAgg, NavigationToolbar2Tk,
+            )
+        except Exception as e:  # matplotlib 미설치 등
+            ttk.Label(
+                tab, anchor="center", justify="center", foreground="gray",
+                text=("그래프를 표시하려면 matplotlib 이 필요합니다.\n"
+                      "pip install matplotlib\n\n"
+                      f"({e})"),
+            ).pack(fill="both", expand=True, padx=12, pady=12)
+            return
+
+        ctrl = ttk.Frame(tab)
+        ctrl.pack(fill="x", padx=4, pady=(4, 0))
+        self._plot_strain_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ctrl, text="Strain 함께 표시 (오른쪽 축)",
+            variable=self._plot_strain_var, command=self._refresh_plot,
+        ).pack(side="left", padx=(0, 10))
+        self._plot_grid_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ctrl, text="격자", variable=self._plot_grid_var,
+            command=self._refresh_plot,
+        ).pack(side="left")
+
+        self._fig = Figure(figsize=(7.0, 4.0), dpi=100)
+        self._ax = self._fig.add_subplot(111)
+        self._canvas = FigureCanvasTkAgg(self._fig, master=tab)
+        self._canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=(2, 0))
+
+        toolbar_frame = ttk.Frame(tab)
+        toolbar_frame.pack(fill="x", padx=4, pady=(0, 4))
+        NavigationToolbar2Tk(self._canvas, toolbar_frame).update()
+
+        self._refresh_plot()
+
+    def _refresh_plot(self) -> None:
+        """현재 결과로 온도-CTE 그래프를 다시 그린다."""
+        if self._canvas is None:
+            return
+
+        ax = self._ax
+        if self._ax2 is not None:
+            self._ax2.remove()
+            self._ax2 = None
+        ax.clear()
+
+        unit = self._unit_var.get()
+        ax.set_xlabel("Temperature (\u00b0C)")
+        ax.set_ylabel(f"CTE ({unit})", color="#c0392b")
+        ax.tick_params(axis="y", labelcolor="#c0392b")
+        # grid(False, alpha=...) 는 경고와 함께 오히려 격자를 켜버리므로 분기한다.
+        if self._plot_grid_var.get():
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.grid(False)
+
+        if not self._rows:
+            ax.text(
+                0.5, 0.5, "No data - run the conversion first",
+                ha="center", va="center", transform=ax.transAxes, color="gray",
+            )
+            self._fig.tight_layout()
+            self._canvas.draw_idle()
+            return
+
+        temps = [r[1] for r in self._rows]
+        strains = [r[2] for r in self._rows]
+        cte = [self._scaled(r[3]) for r in self._rows]
+
+        handles = ax.plot(
+            temps, cte, marker="o", markersize=5, linewidth=1.8,
+            color="#c0392b", label=f"CTE ({unit})",
+        )
+
+        if self._plot_strain_var.get():
+            self._ax2 = ax.twinx()
+            handles += self._ax2.plot(
+                temps, strains, marker="s", markersize=4, linewidth=1.2,
+                linestyle="--", color="#2c6fbb", alpha=0.75, label="Strain",
+            )
+            self._ax2.set_ylabel("Strain", color="#2c6fbb")
+            self._ax2.tick_params(axis="y", labelcolor="#2c6fbb")
+
+        ax.legend(handles, [h.get_label() for h in handles], loc="best", fontsize=9)
+
+        title = "CTE vs Temperature"
+        if self._source_material:
+            title += f"  ({self._source_material}"
+            title += f", {self._source_label})" if self._source_label else ")"
+        ax.set_title(title, fontsize=10)
+
+        self._fig.tight_layout()
+        self._canvas.draw_idle()
 
     def _table_text(self) -> str:
         """표를 탭 구분(TSV) 텍스트로 만든다 — 엑셀에 바로 붙여넣기 가능."""
