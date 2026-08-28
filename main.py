@@ -38,12 +38,14 @@ from tools.screenshot_tool import ScreenshotTool
 from tools.variable_compare_tool import VariableCompareTool
 from tools.file_compare_tool import FileCompareTool
 from tools.trace_mapping import TraceMappingTool
+from tools.strain_to_cte_tool import StrainToCteTool
 
 TOOLS: list[Type[BaseTool]] = [
     ScreenshotTool,
     VariableCompareTool,
     FileCompareTool,
     TraceMappingTool,
+    StrainToCteTool,
     # 새 도구 클래스를 여기에 추가하세요.
 ]
 # ─────────────────────────────────────────────────
