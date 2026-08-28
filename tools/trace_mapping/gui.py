@@ -1,28 +1,25 @@
 """tkinter GUI for Gerber Trace Mapper.
 
-Originally a standalone Tk app; now refactored so it can be embedded into a
-parent frame owned by the Tool Box launcher.
+Entry point: gui_main()
+Called when trace_mapper.py is run without file arguments or with --gui.
+
+All matplotlib work is marshalled back to the main (tkinter) thread via
+parent.after() to avoid "main thread is not in main loop" errors.
 
 Entry points:
   build_gui(parent)   - construct the Gerber Trace Mapper GUI inside the
                         given tk widget (called by TraceMappingTool).
   gui_main()          - run as a standalone Tk application (preserved for
                         backward compatibility with trace_mapper.py CLI).
-
-All matplotlib work is marshalled back to the main (tkinter) thread via
-parent.after() to avoid "main thread is not in main loop" errors.
 """
 
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 from .process import (process_layers, collect_art_files,
-                      load_cached_mappers, CacheMissError)
+                     load_cached_mappers, CacheMissError, normalize_bounds)
 from .plot import plot_comparison
 from .cache import CACHE_DIRNAME
-from .postprocess import (read_region_and_round, iter_target_csvs,
-                          output_path_for, count_comment_lines,
-                          count_csv_rows)
 
 
 class _LogWriter:
@@ -41,7 +38,7 @@ class _LogWriter:
 def build_gui(parent):
     """Construct the Gerber Trace Mapper UI inside ``parent``.
 
-    ``parent`` may be any tk container (Toplevel, Frame, root). The function
+    ``parent`` may be any tk container (Toplevel, Frame, parent). The function
     does not call ``mainloop()`` and does not create its own Tk instance,
     so it can be embedded by the Tool Box launcher.
     """
@@ -108,13 +105,59 @@ def build_gui(parent):
         row=1, column=0, padx=4, pady=2, sticky='e')
     disp_var = tk.StringVar(value="600")
     ttk.Entry(param_frame, textvariable=disp_var, width=8).grid(row=1, column=1, padx=4)
-    ttk.Label(param_frame, text="(left-panel raster, larger=sharper/slower)").grid(
+    ttk.Label(param_frame,
+              text="(raster across the board's longer axis; pixels stay "
+                   "square. larger=sharper/slower)").grid(
         row=1, column=2, columnspan=4, padx=4, pady=2, sticky='w')
+
+    # ---- Explicit mapping bounds (optional) ----
+    bounds_frame = ttk.LabelFrame(
+        parent, text="Mapping Bounds (optional: blank = read from the Gerber files)")
+    bounds_frame.pack(fill='x', padx=8, pady=4)
+
+    bounds_vars = {k: tk.StringVar(value="") for k in ("xmin", "ymin", "xmax", "ymax")}
+    for col, key in enumerate(("xmin", "ymin", "xmax", "ymax")):
+        ttk.Label(bounds_frame, text=f"{key.upper()}:").grid(
+            row=0, column=col * 2, padx=(8, 2), pady=4, sticky='e')
+        ttk.Entry(bounds_frame, textvariable=bounds_vars[key], width=12).grid(
+            row=0, column=col * 2 + 1, padx=(0, 4), pady=4)
+
+    def clear_bounds():
+        for v in bounds_vars.values():
+            v.set("")
+
+    ttk.Button(bounds_frame, text="Clear", command=clear_bounds).grid(
+        row=0, column=8, padx=6, pady=4)
+    ttk.Label(bounds_frame,
+              text="(applied to every layer; overrides Shared bounds)").grid(
+        row=0, column=9, padx=6, pady=4, sticky='w')
+
+    def read_bounds():
+        """(xmin, ymin, xmax, ymax) from the entries, or None when all blank.
+
+        Raises ValueError with a message fit for a dialog.
+        """
+        raw = {k: v.get().strip() for k, v in bounds_vars.items()}
+        filled = [k for k, v in raw.items() if v]
+        if not filled:
+            return None
+        if len(filled) != 4:
+            missing = [k.upper() for k in ("xmin", "ymin", "xmax", "ymax")
+                       if not raw[k]]
+            raise ValueError(
+                "Mapping bounds need all four values; missing: "
+                + ", ".join(missing) + ".\nLeave all four blank to read the "
+                "bounds from the Gerber files instead.")
+        try:
+            vals = [float(raw[k]) for k in ("xmin", "ymin", "xmax", "ymax")]
+        except ValueError:
+            raise ValueError("Mapping bounds must all be numbers.")
+        return normalize_bounds(vals)
 
     # ---- Custom grid (non-uniform cell edges from CSV) ----
     custom_frame = ttk.LabelFrame(
         parent, text="Custom Grid (optional: column-vector CSV of cell edges, "
-                     "overrides NX/NY when both are set)")
+                   "overrides NX/NY when both are set)")
     custom_frame.pack(fill='x', padx=8, pady=4)
 
     x_csv_var = tk.StringVar(value="")
@@ -176,7 +219,8 @@ def build_gui(parent):
     opt_frame = ttk.LabelFrame(parent, text="Options")
     opt_frame.pack(fill='x', padx=8, pady=4)
 
-    even_odd_var = tk.BooleanVar(value=True)
+    polarity_var = tk.BooleanVar(value=True)
+    even_odd_var = tk.BooleanVar(value=False)
     no_merge_var = tk.BooleanVar(value=False)
     interactive_var = tk.BooleanVar(value=False)
     shared_bounds_var = tk.BooleanVar(value=True)
@@ -184,12 +228,15 @@ def build_gui(parent):
     plot_var = tk.BooleanVar(value=True)
     show_var = tk.BooleanVar(value=True)
 
-    ttk.Checkbutton(opt_frame, text="Even-Odd fill", variable=even_odd_var).grid(
+    ttk.Checkbutton(opt_frame, text="Use Gerber polarity (recommended)",
+                    variable=polarity_var).grid(
         row=0, column=0, padx=6, pady=2, sticky='w')
-    ttk.Checkbutton(opt_frame, text="No Merge", variable=no_merge_var).grid(
+    ttk.Checkbutton(opt_frame, text="Even-Odd fill (legacy)", variable=even_odd_var).grid(
         row=0, column=1, padx=6, pady=2, sticky='w')
-    ttk.Checkbutton(opt_frame, text="Interactive exclude", variable=interactive_var).grid(
+    ttk.Checkbutton(opt_frame, text="No Merge", variable=no_merge_var).grid(
         row=0, column=2, padx=6, pady=2, sticky='w')
+    ttk.Checkbutton(opt_frame, text="Interactive exclude", variable=interactive_var).grid(
+        row=0, column=3, padx=6, pady=2, sticky='w')
     ttk.Checkbutton(opt_frame, text="Shared bounds", variable=shared_bounds_var).grid(
         row=1, column=0, padx=6, pady=2, sticky='w')
     ttk.Checkbutton(opt_frame, text="Export CSV", variable=export_csv_var).grid(
@@ -212,6 +259,20 @@ def build_gui(parent):
     cache_var = tk.BooleanVar(value=True)
     ttk.Checkbutton(opt_frame, text="Use raster cache", variable=cache_var).grid(
         row=2, column=2, padx=6, pady=2, sticky='w')
+
+    apdl_var = tk.BooleanVar(value=False)
+    apdl_stride_var = tk.StringVar(value="1")
+    ttk.Checkbutton(opt_frame, text="Export APDL reference-full model",
+                    variable=apdl_var).grid(
+        row=3, column=0, columnspan=2, padx=6, pady=2, sticky='w')
+    af = tk.Frame(opt_frame)
+    af.grid(row=3, column=2, padx=6, pady=2, sticky='w')
+    ttk.Label(af, text="Stride:").pack(side='left')
+    ttk.Spinbox(af, from_=1, to=50, textvariable=apdl_stride_var,
+                width=4).pack(side='left', padx=2)
+    ttk.Label(opt_frame, text="(one 2D element per raster sub-pixel, MAT=Cu/PPG; "
+                              "can be a very large mesh -- raise stride to shrink it)").grid(
+        row=4, column=0, columnspan=4, padx=6, pady=(0, 2), sticky='w')
 
     # ---- Log output ----
     log_frame = ttk.LabelFrame(parent, text="Log")
@@ -237,7 +298,7 @@ def build_gui(parent):
 
     # ---- Run button ----
     run_frame = tk.Frame(parent)
-    run_frame.pack(fill='x', padx=8, pady=(0, 2))
+    run_frame.pack(fill='x', padx=8, pady=(0, 8))
 
     def run_processing():
         paths = list(file_listbox.get(0, tk.END))
@@ -261,6 +322,11 @@ def build_gui(parent):
         except ValueError:
             messagebox.showerror("Invalid", "Display pixels must be an integer.")
             return
+        try:
+            apdl_stride = max(1, int(apdl_stride_var.get()))
+        except ValueError:
+            messagebox.showerror("Invalid", "APDL stride must be an integer.")
+            return
 
         outdir = outdir_var.get().strip() or None
         excl_n = 0
@@ -279,6 +345,12 @@ def build_gui(parent):
                 "or leave both empty to use NX/NY.")
             return
 
+        try:
+            user_bounds = read_bounds()
+        except ValueError as e:
+            messagebox.showerror("Mapping bounds", str(e))
+            return
+
         # Snapshot all Tk vars on the main thread; Tk is not thread-safe.
         opts = {
             'shared_bounds': shared_bounds_var.get(),
@@ -286,7 +358,10 @@ def build_gui(parent):
             'no_merge': no_merge_var.get(),
             'interactive': interactive_var.get(),
             'even_odd': even_odd_var.get(),
+            'use_polarity': polarity_var.get(),
             'cache': cache_var.get(),
+            'export_apdl': apdl_var.get(),
+            'apdl_stride': apdl_stride,
         }
         do_plot = plot_var.get()
         do_show = show_var.get()
@@ -305,6 +380,7 @@ def build_gui(parent):
                 results = process_layers(
                     filepaths=files,
                     nx=nx, ny=ny,
+                    bounds=user_bounds,
                     shared_bounds=opts['shared_bounds'],
                     export_csv=opts['export_csv'],
                     plot=False,
@@ -314,11 +390,14 @@ def build_gui(parent):
                     no_merge=opts['no_merge'],
                     interactive=opts['interactive'],
                     even_odd=opts['even_odd'],
+                    use_polarity=opts['use_polarity'],
                     exclude_largest=excl_n,
                     min_display_pixels=disp_pix,
                     cache=opts['cache'],
                     x_coords_csv=x_csv,
                     y_coords_csv=y_csv,
+                    export_apdl=opts['export_apdl'],
+                    apdl_stride=opts['apdl_stride'],
                 )
 
                 log("\n=== Summary ===\n")
@@ -382,11 +461,9 @@ def build_gui(parent):
         if not paths:
             messagebox.showwarning("No files", "Please add at least one Gerber file.")
             return
-        if not show_var.get():
-            messagebox.showinfo(
-                "Show plots disabled",
-                "Enable 'Show plots' to display interactive figures.")
-            return
+        # The 'Show plots' checkbox governs what a Run does with its figures;
+        # this button's whole purpose is to display them, so it does not gate
+        # on that checkbox.
 
         try:
             nx = int(nx_var.get())
@@ -416,6 +493,12 @@ def build_gui(parent):
             return
 
         try:
+            user_bounds = read_bounds()
+        except ValueError as e:
+            messagebox.showerror("Mapping bounds", str(e))
+            return
+
+        try:
             files = collect_art_files(paths)
             if not files:
                 messagebox.showwarning(
@@ -425,10 +508,12 @@ def build_gui(parent):
             results = load_cached_mappers(
                 filepaths=files,
                 nx=nx, ny=ny,
+                bounds=user_bounds,
                 shared_bounds=shared_bounds_var.get(),
                 merge_tolerance=merge_tol,
                 no_merge=no_merge_var.get(),
                 even_odd=even_odd_var.get(),
+                use_polarity=polarity_var.get(),
                 exclude_largest=excl_n,
                 min_display_pixels=disp_pix,
                 x_coords_csv=x_csv,
@@ -438,8 +523,10 @@ def build_gui(parent):
             messagebox.showerror(
                 "No saved plot data",
                 f"{e}\n\nParameters used here must match a previous Run "
-                "(merge tolerance, even-odd, no-merge, exclude count, "
-                "display pixels, shared bounds, custom grid).")
+                "(merge tolerance, polarity, even-odd, no-merge, exclude "
+                "count, display pixels, mapping bounds, shared bounds, "
+                "custom grid) -- and the same set of files, since shared "
+                "bounds depend on which layers are listed.")
             return
         except Exception as e:
             messagebox.showerror("Error loading cache", str(e))
@@ -473,138 +560,12 @@ def build_gui(parent):
                     log(f"  Failed to remove {c}: {e}\n")
         log(f"Cleared cache in {removed} location(s)\n")
 
-    # ---- Post-processing (rounded table export) ----
-    def run_postprocess():
-        """Run CSV 결과를 (edge 수 만큼 잘라) N 격자 스냅 → *_rounded.txt 생성.
-
-        - input_dir: Output Directory 가 지정돼 있으면 그 경로.
-          비어 있으면 파일 목록에 있는 각 Gerber 파일의 상위 디렉터리.
-        - row_range / col_range: Custom Grid 의 Y / X coords CSV 데이터 개수.
-        - n: 'Rounding N' 입력값 (기본 100).
-        - skiprows: 각 CSV 파일의 선두 '#' 주석 줄 수를 자동 감지.
-        """
-        x_csv = x_csv_var.get().strip()
-        y_csv = y_csv_var.get().strip()
-        if not x_csv or not y_csv:
-            messagebox.showerror(
-                "Custom Grid 필요",
-                "후처리는 Custom Grid 의 X coords CSV 와 Y coords CSV 가 "
-                "모두 설정되어 있어야 합니다.")
-            return
-        if not Path(x_csv).is_file() or not Path(y_csv).is_file():
-            messagebox.showerror(
-                "파일 없음",
-                "X / Y coords CSV 경로가 올바른 파일을 가리키지 않습니다.")
-            return
-
-        try:
-            y_len = count_csv_rows(y_csv)
-            x_len = count_csv_rows(x_csv)
-        except Exception as e:
-            messagebox.showerror("CSV 읽기 오류", str(e))
-            return
-        if y_len < 2 or x_len < 2:
-            messagebox.showerror(
-                "데이터 개수 오류",
-                f"X/Y coords CSV 의 데이터 개수가 부족합니다. "
-                f"(Y={y_len}, X={x_len})")
-            return
-
-        try:
-            n = int(n_var.get())
-            if n < 1:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror(
-                "Invalid N", "Rounding N 은 1 이상의 정수여야 합니다.")
-            return
-
-        outdir = outdir_var.get().strip()
-        if outdir:
-            input_dirs = [outdir]
-        else:
-            gerber_paths = list(file_listbox.get(0, tk.END))
-            input_dirs = sorted({
-                str(Path(p)) if Path(p).is_dir() else str(Path(p).parent)
-                for p in gerber_paths
-            })
-        if not input_dirs:
-            messagebox.showerror(
-                "입력 경로 없음",
-                "후처리 대상 CSV 가 있는 폴더를 찾을 수 없습니다. "
-                "Output Directory 를 지정하거나 Gerber 파일을 추가하세요.")
-            return
-
-        targets = iter_target_csvs(input_dirs, exclude=(x_csv, y_csv))
-        if not targets:
-            messagebox.showwarning(
-                "CSV 없음",
-                "대상 폴더에서 처리할 CSV 를 찾지 못했습니다.\n"
-                "(이미 *_rounded.csv 이거나 X/Y coords CSV 는 제외됩니다)")
-            return
-
-        postproc_btn.config(state='disabled')
-
-        def worker():
-            import traceback
-            ok = 0
-            fail = 0
-            log(f"\n=== Post-process (N={n}, "
-                f"rows={y_len}, cols={x_len}) ===\n")
-            for csv_file in targets:
-                out_path = output_path_for(csv_file, suffix="_rounded.txt")
-                skiprows = count_comment_lines(csv_file)
-                try:
-                    rounded = read_region_and_round(
-                        csv_path=csv_file,
-                        row_range=(0, y_len),
-                        col_range=(0, x_len),
-                        n=n,
-                        skiprows=skiprows,
-                        output_path=out_path,
-                    )
-                    log(f"[OK]  {Path(csv_file).name} -> "
-                        f"{Path(out_path).name}  "
-                        f"shape={rounded.shape}  (skiprows={skiprows})\n")
-                    ok += 1
-                except Exception as e:
-                    log(f"[ERR] {Path(csv_file).name}: {e}\n")
-                    log(traceback.format_exc())
-                    fail += 1
-            log(f"Post-process done. OK={ok}, FAIL={fail}\n")
-            parent.after(0, lambda: postproc_btn.config(state='normal'))
-
-        threading.Thread(target=worker, daemon=True).start()
-
     run_btn = ttk.Button(run_frame, text="Run", command=run_processing)
     run_btn.pack(side='left', padx=4)
     ttk.Button(run_frame, text="Show Saved Plot",
                command=show_saved_plot).pack(side='left', padx=4)
     ttk.Button(run_frame, text="Clear Cache", command=clear_cache).pack(
         side='left', padx=4)
-    ttk.Button(run_frame, text="Close",
-               command=lambda: parent.winfo_toplevel().destroy()).pack(
-        side='right', padx=4)
-
-    # ---- Post-process row ----
-    post_frame = ttk.LabelFrame(
-        parent,
-        text="Post-process (CSV → rounded APDL table)")
-    post_frame.pack(fill='x', padx=8, pady=(2, 8))
-
-    ttk.Label(post_frame, text="Rounding N:").pack(
-        side='left', padx=(8, 2), pady=4)
-    n_var = tk.StringVar(value="100")
-    ttk.Entry(post_frame, textvariable=n_var, width=8).pack(
-        side='left', padx=(0, 8), pady=4)
-    ttk.Label(
-        post_frame,
-        text="(0~1 값을 1/N 격자로 스냅; row/col 개수는 Y/X coords CSV 에서 감지)",
-        foreground="gray",
-    ).pack(side='left', padx=(0, 8), pady=4)
-    postproc_btn = ttk.Button(
-        post_frame, text="Run Post-process", command=run_postprocess)
-    postproc_btn.pack(side='right', padx=6, pady=4)
 
 
 def gui_main():

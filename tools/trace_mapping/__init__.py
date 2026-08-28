@@ -1,6 +1,9 @@
 """Gerber Trace Mapping 도구 패키지 (tool_box 연동).
 
 원본: https://github.com/junjy0094-byte/trace_mapping
+동기화 기준: default branch efa479d (2026-08)
+패키지 내부 임포트를 상대 임포트로 바꾸고, gui.gui_main() 을
+build_gui(parent) + gui_main() 으로 분리한 것 외에는 원본과 동일하다.
 BaseTool 인터페이스에 맞춰 GUI 를 parent 프레임으로 임베드한다.
 
 실제 파싱/렌더링 의존성(numpy, matplotlib, shapely, pcb-tools) 은
@@ -17,7 +20,10 @@ class TraceMappingTool(BaseTool):
     """Gerber/Artwork 파일을 NxM 격자의 동박 면적 비율로 변환하는 도구."""
 
     name = "Trace Mapping"
-    default_geometry = "760x680"
+    # 업스트림 GUI 는 Mapping Bounds 한 줄만으로 1153px 를 요구한다.
+    # 창이 이보다 작으면 우측 입력칸과 하단 Run 버튼이 잘린다.
+    default_geometry = "1200x740"
+    min_size = (1180, 700)
 
     def build_ui(self, parent: tk.Frame) -> None:
         try:
