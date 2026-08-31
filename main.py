@@ -41,6 +41,7 @@ from tools.trace_mapping import TraceMappingTool
 from tools.strain_to_cte_tool import StrainToCteTool
 from tools.ball_map import BallMapTool, BallMapBinaryTool
 from tools.db_to_inp import DbToInpTool
+from tools.zone_draw import ZoneDrawTool
 
 TOOLS: list[Type[BaseTool]] = [
     ScreenshotTool,
@@ -51,6 +52,7 @@ TOOLS: list[Type[BaseTool]] = [
     BallMapTool,
     BallMapBinaryTool,
     DbToInpTool,
+    ZoneDrawTool,
     # 새 도구 클래스를 여기에 추가하세요.
 ]
 # ─────────────────────────────────────────────────
@@ -74,8 +76,8 @@ class ToolLauncher:
         self._open_windows: Dict[Type[BaseTool], tk.Toplevel] = {}
 
         root.title("Tool Box")
-        root.geometry("360x480")
-        root.minsize(280, 240)
+        root.geometry("380x700")
+        root.minsize(300, 360)
 
         self._build_ui()
 
