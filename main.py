@@ -42,6 +42,7 @@ from tools.strain_to_cte_tool import StrainToCteTool
 from tools.ball_map import BallMapTool, BallMapBinaryTool
 from tools.db_to_inp import DbToInpTool
 from tools.zone_draw import ZoneDrawTool
+from tools.zone_paint import ZonePaintTool
 
 TOOLS: list[Type[BaseTool]] = [
     ScreenshotTool,
@@ -53,6 +54,7 @@ TOOLS: list[Type[BaseTool]] = [
     BallMapBinaryTool,
     DbToInpTool,
     ZoneDrawTool,
+    ZonePaintTool,
     # 새 도구 클래스를 여기에 추가하세요.
 ]
 # ─────────────────────────────────────────────────
