@@ -12,6 +12,36 @@ from tools.base_tool import BaseTool
 
 TOOL_NAME = "screenshot"
 
+_HELP = """\
+[ 무엇을 하는 도구인가 ]
+  화면의 일부를 드래그로 지정해 캡처하고 곧바로 클립보드에 넣는다. 한 번 지정한
+  영역은 기억되므로, 같은 자리를 반복해서 캡처할 때(해석 결과 창, 그래프 등)
+  버튼 한 번이면 된다. 보고서에 그림을 반복해 붙여 넣는 작업을 염두에 둔 도구다.
+
+[ 입력 ]
+  · 새 영역 스크린샷 : 화면 전체가 어두워지면 원하는 영역을 드래그 (Esc 로 취소)
+  · 크기 배율 0.1~1.0 : 붙여넣기 했을 때의 '표시 크기'
+
+[ 출력 ]
+  · 클립보드 이미지 — 문서/메일/PPT 에 Ctrl+V 로 바로 붙여넣는다
+  · 창 안의 미리보기
+  · 파일로 저장하는 기능은 없다 (붙여넣기 전용)
+
+[ 사용 순서 ]
+  1. [새 영역 스크린샷] → 화면에서 영역을 드래그한다.
+  2. 클립보드에 복사되고 미리보기와 좌표가 표시된다.
+  3. 같은 영역을 다시 찍을 때는 [기존 영역 스크린샷] 만 누른다.
+  4. 붙여 넣었을 때 너무 크면 배율을 낮추고 다시 캡처한다.
+
+[ 참고 ]
+  · 배율은 픽셀을 줄이는 것이 아니라 이미지의 DPI(96/배율)를 바꾸는 방식이라
+    화질 손실 없이 표시 크기만 작아진다.
+  · 좌표와 배율은 config.json 에 저장되어 다음에 도구를 열어도 유지된다.
+  · 클립보드 복사는 OS 별로 Windows=win32clipboard, macOS=osascript,
+    Linux=xclip 을 쓴다. Linux 에서는 xclip 이 설치되어 있어야 한다.
+"""
+
+
 
 def _get_full_screen_bbox() -> tuple[int, int, int, int]:
     """mss를 통해 전체 가상 화면의 (left, top, width, height)를 반환합니다."""
@@ -124,6 +154,8 @@ def _copy_image_to_clipboard(img: Image.Image, scale: float) -> None:
 
 class ScreenshotTool(BaseTool):
     name = "스크린샷"
+    summary = "화면 영역을 드래그로 캡처해 클립보드에 복사 (영역 기억 → 반복 캡처)"
+    help_text = _HELP
     default_geometry = "520x620"
 
     def __init__(self):

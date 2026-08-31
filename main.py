@@ -17,6 +17,7 @@ from tkinter import messagebox, ttk
 from typing import Dict, Type
 
 from tools.base_tool import BaseTool
+from tools.help_browser import attach_tooltip, open_help
 
 
 def _enable_dpi_awareness() -> None:
@@ -88,11 +89,18 @@ class ToolLauncher:
     def _build_ui(self) -> None:
         header = ttk.Frame(self.root, padding=(12, 10, 12, 4))
         header.pack(fill="x")
-        ttk.Label(header, text="Tool Box", font=("", 14, "bold")).pack(anchor="w")
+        title_row = ttk.Frame(header)
+        title_row.pack(fill="x")
+        ttk.Label(title_row, text="Tool Box", font=("", 14, "bold")).pack(side="left")
+        ttk.Button(
+            title_row, text="도움말", width=8,
+            command=lambda: open_help(self.root, self.tools),
+        ).pack(side="right")
         ttk.Label(
             header,
-            text="도구를 클릭하면 새 창으로 열립니다.",
-            foreground="gray",
+            text=("도구를 클릭하면 새 창으로 열립니다.\n"
+                  "이름 옆 [?] 는 그 도구의 도움말입니다."),
+            foreground="gray", justify="left",
         ).pack(anchor="w", pady=(2, 0))
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=12)
@@ -145,11 +153,22 @@ class ToolLauncher:
 
         for tool_cls in self.tools:
             display_name = getattr(tool_cls, "name", "") or tool_cls.__name__
-            btn = ttk.Button(
-                inner, text=display_name,
+            row = ttk.Frame(inner)
+            row.pack(fill="x", pady=3)
+            ttk.Button(
+                row, text=display_name,
                 command=lambda c=tool_cls: self._open_tool(c),
+            ).pack(side="left", fill="x", expand=True, ipady=6)
+            help_btn = ttk.Button(
+                row, text="?", width=3,
+                command=lambda c=tool_cls: open_help(self.root, self.tools, c),
             )
-            btn.pack(fill="x", pady=3, ipady=6)
+            help_btn.pack(side="left", fill="y", padx=(4, 0))
+            summary = getattr(tool_cls, "summary", "")
+            if summary:
+                # 목록을 길게 만들지 않도록 요약은 마우스를 올렸을 때만 보여 준다.
+                attach_tooltip(row, summary)
+            attach_tooltip(help_btn, "이 도구의 도움말 보기")
 
         # 상태 표시줄
         self._status_var = tk.StringVar(value=f"등록된 도구 {len(self.tools)}개")
@@ -183,6 +202,17 @@ class ToolLauncher:
         win.geometry(getattr(instance, "default_geometry", "900x650"))
         min_w, min_h = getattr(instance, "min_size", (480, 360))
         win.minsize(min_w, min_h)
+
+        bar = ttk.Frame(win, padding=(8, 4, 8, 0))
+        bar.pack(fill="x")
+        ttk.Label(bar, text=getattr(instance, "summary", ""),
+                  foreground="gray", wraplength=760, justify="left").pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(
+            bar, text="도움말", width=8,
+            command=lambda c=tool_cls: open_help(self.root, self.tools, c),
+        ).pack(side="right")
+        ttk.Separator(win, orient="horizontal").pack(fill="x", padx=8, pady=(4, 0))
 
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True)

@@ -10,6 +10,40 @@ from tools.base_tool import BaseTool
 from tools._dnd_helper import has_dnd, register_drop_target
 from tools.file_compare_tool import _path_tail
 
+_HELP = """\
+[ 무엇을 하는 도구인가 ]
+  여러 개의 ANSYS APDL 입력 파일에서 변수 정의를 뽑아내, 파일별 값을 한 표에
+  나란히 놓고 비교한다. "이번 해석과 지난 해석의 조건이 어디가 다른가"를
+  파일을 일일이 열어보지 않고 확인하기 위한 도구다.
+
+[ 입력 ]
+  · APDL 입력 파일 여러 개 (.txt .inp .ans .mac .dat .cdb — 확장자 제한 없음)
+  · [파일 추가] 버튼 또는 목록에 드래그 앤 드롭
+  · 인식하는 형식 두 가지
+      VAR = VALUE          (예: BUMP_H = 0.05)
+      *SET,VAR,VALUE       (예: *SET,BUMP_H,0.05)
+    '!' 뒤쪽은 주석으로 버린다.
+
+[ 출력 ]
+  · 화면의 비교 표 (변수 1열 + 파일별 값). 파일로 저장하지는 않는다.
+  · 값이 서로 다르거나 한쪽에만 있는 행은 분홍색으로 강조된다.
+  · 상태줄에 "총 변수 / 차이 / 표시" 개수가 나온다.
+
+[ 사용 순서 ]
+  1. 비교할 파일을 2개 이상 추가한다.
+  2. [비교] 를 누른다.
+  3. [차이만 표시] 를 켜면 값이 다른 변수만 남는다.
+  4. 변수 필터에 문자열을 넣으면 이름에 그 문자열이 든 변수만 본다.
+  5. 파일 이름이 겹쳐 구분이 안 되면 '경로 깊이' 를 올려 상위 폴더까지 표시한다.
+
+[ 참고 ]
+  · 변수 이름은 대문자로 통일해 비교한다.
+  · 값은 문자열 그대로 비교하므로 0.05 와 5e-2 는 '다름' 으로 나온다.
+  · 같은 변수가 파일 안에서 여러 번 정의되면 마지막 값이 표에 남는다.
+  · 값이 비어 있는 칸은 그 파일에 해당 변수가 없다는 뜻이다.
+"""
+
+
 
 def parse_apdl_variables(filepath: str) -> Dict[str, str]:
     """APDL 입력 파일에서 변수 할당을 파싱한다.
@@ -55,6 +89,8 @@ class VariableCompareTool(BaseTool):
     """여러 ANSYS APDL 입력 파일의 변수를 비교하는 도구."""
 
     name = "input 변수 비교"
+    summary = "여러 APDL 입력 파일의 변수 값을 한 표에서 비교 (차이 강조)"
+    help_text = _HELP
 
     _FILETYPES = [
         ("APDL 파일", "*.txt *.inp *.ans *.mac *.dat *.cdb"),
