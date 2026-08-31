@@ -21,7 +21,7 @@ from tools.base_tool import BaseTool
 class ZoneDrawTool(BaseTool):
     """범프 맵 위에 zone 폴리곤을 그려 ANSYS APDL 매크로로 내보내는 도구."""
 
-    name = "Zone 분할기 (범프 → APDL 매크로)"
+    name = "Bump array 내 sub zone 생성기"
     default_geometry = "680x800"
     min_size = (620, 720)
 
