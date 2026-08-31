@@ -38,12 +38,19 @@ from tools.screenshot_tool import ScreenshotTool
 from tools.variable_compare_tool import VariableCompareTool
 from tools.file_compare_tool import FileCompareTool
 from tools.trace_mapping import TraceMappingTool
+from tools.strain_to_cte_tool import StrainToCteTool
+from tools.ball_map import BallMapTool, BallMapBinaryTool
+from tools.db_to_inp import DbToInpTool
 
 TOOLS: list[Type[BaseTool]] = [
     ScreenshotTool,
     VariableCompareTool,
     FileCompareTool,
     TraceMappingTool,
+    StrainToCteTool,
+    BallMapTool,
+    BallMapBinaryTool,
+    DbToInpTool,
     # 새 도구 클래스를 여기에 추가하세요.
 ]
 # ─────────────────────────────────────────────────
@@ -170,7 +177,8 @@ class ToolLauncher:
         win = tk.Toplevel(self.root)
         win.title(getattr(instance, "name", tool_cls.__name__))
         win.geometry(getattr(instance, "default_geometry", "900x650"))
-        win.minsize(480, 360)
+        min_w, min_h = getattr(instance, "min_size", (480, 360))
+        win.minsize(min_w, min_h)
 
         frame = ttk.Frame(win)
         frame.pack(fill="both", expand=True)
