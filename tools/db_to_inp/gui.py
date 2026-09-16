@@ -7,8 +7,10 @@ parent 프레임 안에 임베드할 수 있도록 ``build_gui(parent)`` 를 추
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 import threading
+import queue
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 
 from . import mapdl_ops, cdb_utils, inp_writer, utils
 
@@ -68,7 +70,39 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
 
 9. 초기/최종 온도
    - Settings에서 직접 설정 가능합니다 (기본값: 초기 183.0, 최종 25.0).
+
+10. 폴더 일괄 변환 (Batch)
+   - File Selection에서 "Folder (batch)"를 고르면 선택한 폴더 안의 .db 파일을
+     모두 변환합니다. "Include subfolders"를 켜면 하위 폴더까지 훑습니다.
+   - 일괄 모드에서는 파일마다 이름이 "sub"로 끝나는지 자동으로 판단해
+     Sub-model 여부를 개별 적용합니다 (Sub-model 체크박스는 단일 파일 모드 전용).
+   - 중간 산출물은 파일별로 분리된 폴더(<폴더>/_data/<모델명>/)에 저장되고,
+     결과 .inp는 원본 .db와 같은 폴더에 <모델명>.inp 로 생성됩니다.
+     (단일 파일 모드는 기존과 같이 <폴더>/_data/ 를 그대로 씁니다.)
+   - 한 파일이 실패해도 나머지는 계속 진행하며, 마지막에 성공/실패 요약을 찍습니다.
+
+11. 병렬 실행 (Parallel jobs)
+   - MAPDL Launch Settings의 "Parallel jobs"는 동시에 돌릴 파일 개수입니다.
+     1이면 기존처럼 한 번에 하나씩 순차 실행합니다.
+   - 파일마다 MAPDL 인스턴스가 따로 뜹니다. 즉 실제로 쓰는 코어 수는
+     (Parallel jobs x Processors)이고, 라이선스도 그만큼 동시에 물립니다.
+     코어/라이선스/메모리 여유를 보고 값을 정하세요.
+   - 병렬 실행 중에는 로그 줄 앞에 [모델명] 이 붙어 어느 파일의 로그인지
+     구분됩니다.
 """
+
+
+class _Job:
+    """변환할 .db 파일 하나에 대한 실행 정보."""
+
+    __slots__ = ("db_path", "data_dir", "is_submodel", "prefix")
+
+    def __init__(self, db_path, data_dir, is_submodel, prefix=""):
+        self.db_path = db_path
+        self.data_dir = data_dir
+        self.is_submodel = is_submodel
+        # 병렬 실행 시 로그 줄 앞에 붙일 "[모델명] " 표시
+        self.prefix = prefix
 
 
 class ConverterApp:
@@ -78,10 +112,14 @@ class ConverterApp:
         self.root = root
         if isinstance(root, (tk.Tk, tk.Toplevel)):
             root.title("ANSYS → Abaqus Converter")
-            root.geometry("720x880")
+            root.geometry("720x980")
             root.resizable(False, False)
 
         self.db_path = tk.StringVar()
+        # "file" = 단일 .db, "folder" = 폴더 안의 .db 전부 일괄 변환
+        self.input_mode = tk.StringVar(value="file")
+        self.batch_dir = tk.StringVar()
+        self.batch_recursive = tk.BooleanVar(value=False)
         self.output_dir = tk.StringVar()
         self.data_dir = tk.StringVar()
         self.node_tol = tk.StringVar(value="1e-6")
@@ -104,11 +142,22 @@ class ConverterApp:
         self.ortho_mat_range = tk.StringVar(value="9990-9999")
         self.mapdl_version = tk.StringVar(value="242")
         self.nproc = tk.StringVar(value="4")
+        # 동시에 돌릴 파일 개수 (1 이면 기존처럼 순차 실행)
+        self.max_jobs = tk.StringVar(value="1")
         self.license_type = tk.StringVar(value="preppost")
 
         self._step1_log_path = None
+        # 작업 스레드가 여러 개일 수 있으므로 로그는 큐에 넣고 메인 스레드에서만 그린다.
+        self._log_queue = queue.Queue()
+        # 작업이 끝나면 여기서 올려두고, Run 버튼은 메인 스레드에서 다시 켠다.
+        self._batch_done = threading.Event()
+        # 두 인스턴스가 동시에 포트를 잡으려다 충돌하지 않도록 MAPDL 기동만 직렬화한다.
+        # (기동 후 무거운 작업은 그대로 병렬로 돈다.)
+        self._launch_lock = threading.Lock()
         self.db_path.trace_add("write", self._on_db_path_change)
         self._build_ui()
+        self._on_input_mode_change()
+        self.root.after(120, self._drain_log)
 
     # -----------------------------------------------------------------------
     # UI construction
@@ -118,16 +167,42 @@ class ConverterApp:
         frm_file = tk.LabelFrame(self.root, text="File Selection", padx=10, pady=5)
         frm_file.pack(fill="x", padx=10, pady=(10, 5))
 
-        tk.Label(frm_file, text="ANSYS .db:").grid(row=0, column=0, sticky="w")
-        tk.Entry(frm_file, textvariable=self.db_path, width=55).grid(row=0, column=1, padx=5)
-        tk.Button(frm_file, text="Browse", command=self._browse_db).grid(row=0, column=2)
+        frm_mode = tk.Frame(frm_file)
+        frm_mode.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 3))
+        tk.Radiobutton(
+            frm_mode, text="Single file", variable=self.input_mode, value="file",
+            command=self._on_input_mode_change,
+        ).pack(side="left")
+        tk.Radiobutton(
+            frm_mode, text="Folder (batch — every .db in the folder)",
+            variable=self.input_mode, value="folder",
+            command=self._on_input_mode_change,
+        ).pack(side="left", padx=(15, 0))
 
-        tk.Checkbutton(
+        tk.Label(frm_file, text="ANSYS .db:").grid(row=1, column=0, sticky="w")
+        self.ent_db = tk.Entry(frm_file, textvariable=self.db_path, width=55)
+        self.ent_db.grid(row=1, column=1, padx=5)
+        self.btn_browse_db = tk.Button(frm_file, text="Browse", command=self._browse_db)
+        self.btn_browse_db.grid(row=1, column=2)
+
+        tk.Label(frm_file, text="Folder:").grid(row=2, column=0, sticky="w", pady=(3, 0))
+        self.ent_dir = tk.Entry(frm_file, textvariable=self.batch_dir, width=55)
+        self.ent_dir.grid(row=2, column=1, padx=5, pady=(3, 0))
+        self.btn_browse_dir = tk.Button(frm_file, text="Browse", command=self._browse_dir)
+        self.btn_browse_dir.grid(row=2, column=2, pady=(3, 0))
+
+        self.chk_recursive = tk.Checkbutton(
+            frm_file, text="Include subfolders", variable=self.batch_recursive,
+        )
+        self.chk_recursive.grid(row=3, column=1, sticky="w")
+
+        self.chk_submodel = tk.Checkbutton(
             frm_file,
             text="Sub-model (.db is a submodel — skips tie processing, uses submodel BCs; "
-                 "auto-set when filename ends with 'sub')",
+                 "auto-set when filename ends with 'sub'. Batch mode decides per file.)",
             variable=self.is_submodel,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        )
+        self.chk_submodel.grid(row=4, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
         frm_set = tk.LabelFrame(self.root, text="Settings", padx=10, pady=5)
         frm_set.pack(fill="x", padx=10, pady=5)
@@ -186,6 +261,17 @@ class ConverterApp:
             row=1, column=1, sticky="w", padx=5, pady=(5, 0)
         )
 
+        tk.Label(frm_mapdl, text="Parallel jobs:").grid(row=1, column=2, sticky="w", padx=(15, 0), pady=(5, 0))
+        tk.Entry(frm_mapdl, textvariable=self.max_jobs, width=6).grid(
+            row=1, column=3, sticky="w", padx=5, pady=(5, 0)
+        )
+        tk.Label(
+            frm_mapdl,
+            text="(files converted at the same time — each one launches its own MAPDL, "
+                 "so cores/licenses used = Parallel jobs x Processors)",
+            fg="#555555",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(3, 0))
+
         frm_run = tk.Frame(self.root, pady=5)
         frm_run.pack(fill="x", padx=10)
 
@@ -234,10 +320,51 @@ class ConverterApp:
             self.db_path.set(path)
             self.output_dir.set(os.path.dirname(path))
 
+    def _browse_dir(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.batch_dir.set(path)
+            self.output_dir.set(path)
+
+    def _is_batch(self):
+        return self.input_mode.get() == "folder"
+
+    def _on_input_mode_change(self, *_args):
+        """Enable only the widgets that belong to the selected input mode."""
+        batch = self._is_batch()
+        file_state = "disabled" if batch else "normal"
+        dir_state = "normal" if batch else "disabled"
+        for w in (self.ent_db, self.btn_browse_db, self.chk_submodel):
+            w.config(state=file_state)
+        for w in (self.ent_dir, self.btn_browse_dir, self.chk_recursive):
+            w.config(state=dir_state)
+
     def _on_db_path_change(self, *_args):
         """Auto-toggle Sub-model when the .db filename ends with 'sub' (case-insensitive)."""
-        stem = os.path.splitext(os.path.basename(self.db_path.get()))[0]
-        self.is_submodel.set(stem.lower().endswith("sub"))
+        self.is_submodel.set(self._auto_submodel(self.db_path.get()))
+
+    @staticmethod
+    def _auto_submodel(db_path):
+        """'sub' 로 끝나는 파일명(대소문자 무관)이면 submodel 로 본다."""
+        stem = os.path.splitext(os.path.basename(db_path))[0]
+        return stem.lower().endswith("sub")
+
+    def _collect_db_files(self, folder):
+        """폴더 안의 .db 파일 목록 (이름순). 중간 산출물 폴더(_data)는 건너뛴다."""
+        found = []
+        if self.batch_recursive.get():
+            for root, dirs, files in os.walk(folder):
+                dirs[:] = [d for d in dirs if d != "_data"]
+                found += [os.path.join(root, f) for f in files if f.lower().endswith(".db")]
+        else:
+            found = [
+                os.path.join(folder, f) for f in os.listdir(folder)
+                if f.lower().endswith(".db") and os.path.isfile(os.path.join(folder, f))
+            ]
+        # Step 1 이 만들어 둔 중간 결과물은 입력으로 다시 잡지 않는다.
+        found = [f for f in found
+                 if os.path.splitext(os.path.basename(f))[0].lower() != "clean_model"]
+        return sorted(found, key=lambda f: os.path.basename(f).lower())
 
     def _parse_ortho_mat_range(self):
         text = self.ortho_mat_range.get().strip()
@@ -292,17 +419,32 @@ class ConverterApp:
         tk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 5))
 
     def _log(self, msg):
-        self.log.config(state="normal")
-        self.log.insert("end", msg + "\n")
-        self.log.see("end")
-        self.log.config(state="disabled")
-        self.root.update_idletasks()
+        """어느 스레드에서 불러도 안전하도록 큐에만 넣는다."""
+        self._log_queue.put(msg)
+
+    def _drain_log(self):
+        """메인 스레드에서 주기적으로 큐를 비워 Log 위젯에 그린다."""
+        lines = []
+        try:
+            while True:
+                lines.append(self._log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        try:
+            if lines:
+                self.log.config(state="normal")
+                self.log.insert("end", "\n".join(lines) + "\n")
+                self.log.see("end")
+                self.log.config(state="disabled")
+            if self._batch_done.is_set():
+                self._batch_done.clear()
+                self.btn_run.config(state="normal")
+            self.root.after(120, self._drain_log)
+        except tk.TclError:
+            # 창이 닫혀 위젯이 사라진 경우 — 반복을 멈춘다.
+            pass
 
     def _run(self):
-        db_path = self.db_path.get()
-        if not db_path:
-            messagebox.showwarning("Warning", "Select an ANSYS .db file first.")
-            return
         if self.free_mesh.get():
             messagebox.showwarning(
                 "Not Supported",
@@ -317,42 +459,62 @@ class ConverterApp:
                 "This feature is planned for a future update.",
             )
             return
-        out_dir = os.path.dirname(os.path.abspath(db_path))
+        try:
+            jobs = self._collect_jobs()
+            opts = self._collect_options()
+        except ValueError as e:
+            messagebox.showwarning("Warning", str(e))
+            return
+
+        for job in jobs:
+            os.makedirs(job.data_dir, exist_ok=True)
+        self.btn_run.config(state="disabled")
+        threading.Thread(target=self._run_batch, args=(jobs, opts), daemon=True).start()
+
+    def _collect_jobs(self):
+        """실행 모드에 맞춰 변환할 파일 목록(_Job)을 만든다."""
+        if self._is_batch():
+            folder = self.batch_dir.get().strip()
+            if not folder:
+                raise ValueError("Select a folder first.")
+            if not os.path.isdir(folder):
+                raise ValueError(f"Folder not found: {folder}")
+            db_files = self._collect_db_files(folder)
+            if not db_files:
+                raise ValueError(f"No .db file found in: {folder}")
+            self.output_dir.set(folder)
+            self.data_dir.set(os.path.join(folder, "_data"))
+            return [
+                _Job(
+                    db_path=os.path.abspath(f),
+                    # 파일끼리 중간 산출물이 섞이지 않도록 모델별 폴더를 쓴다.
+                    data_dir=os.path.join(os.path.dirname(os.path.abspath(f)), "_data",
+                                          os.path.splitext(os.path.basename(f))[0]),
+                    is_submodel=self._auto_submodel(f),
+                    prefix=f"[{os.path.splitext(os.path.basename(f))[0]}] ",
+                )
+                for f in db_files
+            ]
+
+        db_path = self.db_path.get().strip()
+        if not db_path:
+            raise ValueError("Select an ANSYS .db file first.")
+        if not os.path.isfile(db_path):
+            raise ValueError(f"File not found: {db_path}")
+        db_path = os.path.abspath(db_path)
+        out_dir = os.path.dirname(db_path)
         data_dir = os.path.join(out_dir, "_data")
-        os.makedirs(data_dir, exist_ok=True)
         self.output_dir.set(out_dir)
         self.data_dir.set(data_dir)
-        self.btn_run.config(state="disabled")
-        threading.Thread(target=self._run_pipeline, daemon=True).start()
+        return [_Job(
+            db_path=db_path,
+            data_dir=data_dir,
+            is_submodel=self.is_submodel.get(),
+            prefix="",
+        )]
 
-    # -----------------------------------------------------------------------
-    # Pipeline
-    # -----------------------------------------------------------------------
-
-    def _run_pipeline(self):
-        until = self.run_until.get()
-        try:
-            self._step1_cleanup()
-            if until.startswith("Step 1"):
-                self._log("\n=== Stopped after Step 1 ===")
-                return
-            cdb_path = os.path.join(self.data_dir.get(), "clean_model.cdb")
-            self._step2_build_inp(cdb_path)
-            self._log("\n=== All steps completed ===")
-        except Exception as e:
-            self._log(f"\n[ERROR] {e}")
-        finally:
-            self.btn_run.config(state="normal")
-
-    def _step1_cleanup(self):
-        """PyMAPDL: cleanup model and CDWRITE."""
-        self._log("=== Step 1: PyMAPDL cleanup + CDWRITE ===")
-
-        from ansys.mapdl.core import launch_mapdl
-
-        out_dir = self.data_dir.get()
-        os.makedirs(out_dir, exist_ok=True)
-
+    def _collect_options(self):
+        """작업 스레드에서 tk 변수를 읽지 않도록 설정값을 미리 스냅샷한다."""
         version_str = self.mapdl_version.get().strip()
         if version_str:
             try:
@@ -364,130 +526,10 @@ class ConverterApp:
         else:
             version = 242
 
-        nproc = int(self.nproc.get().strip()) if self.nproc.get().strip() else 4
-        license_type = self.license_type.get().strip() or "preppost"
-
-        mapdl = launch_mapdl(
-            run_location=out_dir,
-            override=True,
-            version=version,
-            nproc=nproc,
-            license_type=license_type,
-            additional_switches="-smp",
-        )
-        self._log(f"MAPDL launched (v{mapdl.version})")
-
-        self._step1_log_path = os.path.join(out_dir, "step1_apdl.log")
         try:
-            mapdl.open_apdl_log(self._step1_log_path, mode="w")
-            self._log(f"APDL command log: {self._step1_log_path}")
-        except Exception as e:
-            self._log(f"  (APDL log not started: {e})")
-
-        try:
-            db_src = self.db_path.get()
-            db_dst = os.path.join(out_dir, os.path.basename(db_src))
-            if os.path.normpath(db_src) != os.path.normpath(db_dst):
-                shutil.copy2(db_src, db_dst)
-                self._log(f"Copied .db to run_location: {db_dst}")
-            db_name = os.path.splitext(os.path.basename(db_src))[0]
-            mapdl.resume(db_name, "db")
-            self._log(f"Resumed: {db_name}")
-
-            mapdl.prep7()
-
-            self._log("Merging duplicate nodes...")
-            tol = float(self.node_tol.get())
-            mapdl.nummrg("NODE", tol)
-
-            self._log("Processing tie (CE) conditions and loads...")
-            mapdl_ops.handle_ties_and_loads(mapdl, self._log, is_submodel=self.is_submodel.get())
-
-            self._log("Removing unused material properties...")
-            mapdl_ops.remove_unused_mats(mapdl, self._log)
-
-            mapdl.allsel("ALL")
-
-            db_name = "clean_model"
-            self._log(f"Saving cleaned model as {db_name}.db ...")
-            mapdl.save(db_name, "db")
-            self._log(f"{db_name}.db saved.")
-
-            cdb_name = "clean_model"
-            is_full_run = self.run_until.get().startswith("Step 2")
-            user_wants_unblocked = bool(self.cdwrite_unblocked.get())
-            use_unblocked = user_wants_unblocked and not is_full_run
-            if user_wants_unblocked and is_full_run:
-                self._log(
-                    "  (UNBLOCKED requested, but full Step 2 run requires "
-                    "BLOCKED for the CDB parser — overriding.)"
-                )
-            fmat = "UNBLOCKED" if use_unblocked else ""
-            self._log(
-                f"Writing {cdb_name}.cdb "
-                f"({'UNBLOCKED' if use_unblocked else 'BLOCKED'} format) ..."
-            )
-            mapdl.cdwrite("DB", cdb_name, "cdb", fmat=fmat)
-            self._log("CDWRITE complete.")
-
-            if not use_unblocked:
-                cdb_path = os.path.join(out_dir, f"{cdb_name}.cdb")
-                expanded = cdb_utils.expand_etblock(cdb_path)
-                if expanded:
-                    self._log(f"  Expanded ETBLOCK -> {expanded} ET/KEYOPT card(s).")
-                rewritten = cdb_utils.rewrite_mp_mpdata_to_classic(cdb_path)
-                if rewritten:
-                    self._log(
-                        f"  Rewrote {rewritten} MP/MPDATA line(s) to "
-                        f"classic format (abaqus fromansys compatible)."
-                    )
-
-            self._export_step1_metadata(mapdl, out_dir)
-
-        finally:
-            try:
-                mapdl.exit()
-            except Exception:
-                try:
-                    mapdl.exit(force=True)
-                except Exception as e:
-                    self._log(f"MAPDL exit warning: {e}")
-            self._log("MAPDL closed.")
-
-    def _export_step1_metadata(self, mapdl, out_dir):
-        """Save nset/material metadata from MAPDL to text files."""
-        nset_path = os.path.join(out_dir, "step1_nsets.txt")
-        mplist_path = os.path.join(out_dir, "step1_mplist.txt")
-
-        nset_data = mapdl_ops.collect_nset_data(
-            mapdl, self._log,
-            is_submodel=self.is_submodel.get(),
-            symmetry_mode=self._symmetry_key(),
-        )
-        with open(nset_path, "w") as f:
-            for name, ids in nset_data.items():
-                f.write(f"[{name}]\n")
-                for i in range(0, len(ids), 16):
-                    f.write(", ".join(str(v) for v in ids[i:i + 16]) + "\n")
-                f.write("\n")
-        self._log(f"Saved nset metadata: {nset_path}")
-
-        mapdl_ops.dump_mapdl_mplist(mapdl, mplist_path)
-        self._log(f"Saved material metadata: {mplist_path}")
-
-    def _step2_build_inp(self, cdb_path):
-        """CDB 직접 파싱 → Abaqus INP 템플릿 생성."""
-        self._log("\n=== Step 2: direct text INP build (no fromansys) ===")
-
-        out_dir = self.output_dir.get()
-        data_dir = self.data_dir.get() or out_dir
-        db_src = self.db_path.get()
-        inp_stem = (
-            os.path.splitext(os.path.basename(db_src))[0]
-            if db_src else "converted_model"
-        )
-        inp_path = os.path.join(out_dir, f"{inp_stem}.inp")
-
+            node_tol = float(self.node_tol.get())
+        except ValueError:
+            raise ValueError(f"Node Merge Tol must be numeric. Got: '{self.node_tol.get()}'")
         try:
             init_temp = float(self.init_temp.get())
             final_temp = float(self.final_temp.get())
@@ -496,7 +538,218 @@ class ConverterApp:
                 "Initial/Final Temp must be numeric. "
                 f"Got init='{self.init_temp.get()}' final='{self.final_temp.get()}'"
             )
-        ortho_mat_range = self._parse_ortho_mat_range()
+        try:
+            nproc = int(self.nproc.get().strip()) if self.nproc.get().strip() else 4
+        except ValueError:
+            raise ValueError(f"Processors must be an integer. Got: '{self.nproc.get()}'")
+        try:
+            max_jobs = int(self.max_jobs.get().strip()) if self.max_jobs.get().strip() else 1
+        except ValueError:
+            raise ValueError(f"Parallel jobs must be an integer. Got: '{self.max_jobs.get()}'")
+        if max_jobs < 1:
+            raise ValueError("Parallel jobs must be 1 or more.")
+
+        return {
+            "node_tol": node_tol,
+            "init_temp": init_temp,
+            "final_temp": final_temp,
+            "cdwrite_unblocked": bool(self.cdwrite_unblocked.get()),
+            "symmetry_mode": self._symmetry_key(),
+            "has_orthotropic": bool(self.has_orthotropic.get()),
+            "ortho_mat_range": self._parse_ortho_mat_range(),
+            "version": version,
+            "nproc": nproc,
+            "license_type": self.license_type.get().strip() or "preppost",
+            "max_jobs": max_jobs,
+            "stop_after_step1": self.run_until.get().startswith("Step 1"),
+        }
+
+    # -----------------------------------------------------------------------
+    # Pipeline
+    # -----------------------------------------------------------------------
+
+    def _run_batch(self, jobs, opts):
+        """jobs 를 순차 또는 병렬로 돌리고 마지막에 요약을 남긴다."""
+        try:
+            workers = min(opts["max_jobs"], len(jobs))
+            if len(jobs) > 1:
+                self._log(
+                    f"=== Batch: {len(jobs)} file(s), "
+                    f"{workers} at a time ==="
+                )
+            if workers <= 1:
+                results = [self._run_pipeline(job, opts) for job in jobs]
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    results = list(pool.map(lambda j: self._run_pipeline(j, opts), jobs))
+
+            if len(jobs) > 1:
+                failed = [r for r in results if not r[1]]
+                self._log(
+                    f"\n=== Batch done: {len(results) - len(failed)} succeeded, "
+                    f"{len(failed)} failed ==="
+                )
+                for job, _ok, err in failed:
+                    self._log(f"  FAILED {os.path.basename(job.db_path)}: {err}")
+        finally:
+            self._batch_done.set()
+
+    def _run_pipeline(self, job, opts):
+        """파일 하나를 변환한다. 예외는 삼켜서 (job, ok, err) 로 돌려준다."""
+        def log(msg):
+            if not job.prefix:
+                self._log(msg)
+                return
+            # 빈 줄(앞뒤 여백)에는 붙이지 않고 내용이 있는 줄에만 [모델명] 을 단다.
+            self._log("\n".join(
+                job.prefix + line if line.strip() else line
+                for line in str(msg).split("\n")
+            ))
+
+        try:
+            log(f"\n=== Converting: {job.db_path} ===")
+            self._step1_cleanup(job, opts, log)
+            if opts["stop_after_step1"]:
+                log("=== Stopped after Step 1 ===")
+                return (job, True, None)
+            cdb_path = os.path.join(job.data_dir, "clean_model.cdb")
+            self._step2_build_inp(job, opts, cdb_path, log)
+            log("=== All steps completed ===")
+            return (job, True, None)
+        except Exception as e:
+            log(f"[ERROR] {e}")
+            return (job, False, e)
+
+    def _step1_cleanup(self, job, opts, log):
+        """PyMAPDL: cleanup model and CDWRITE."""
+        log("=== Step 1: PyMAPDL cleanup + CDWRITE ===")
+
+        from ansys.mapdl.core import launch_mapdl
+
+        out_dir = job.data_dir
+        os.makedirs(out_dir, exist_ok=True)
+
+        with self._launch_lock:
+            mapdl = launch_mapdl(
+                run_location=out_dir,
+                override=True,
+                version=opts["version"],
+                nproc=opts["nproc"],
+                license_type=opts["license_type"],
+                additional_switches="-smp",
+            )
+        log(f"MAPDL launched (v{mapdl.version})")
+
+        step1_log_path = os.path.join(out_dir, "step1_apdl.log")
+        self._step1_log_path = step1_log_path
+        try:
+            mapdl.open_apdl_log(step1_log_path, mode="w")
+            log(f"APDL command log: {step1_log_path}")
+        except Exception as e:
+            log(f"  (APDL log not started: {e})")
+
+        try:
+            db_src = job.db_path
+            db_dst = os.path.join(out_dir, os.path.basename(db_src))
+            if os.path.normpath(db_src) != os.path.normpath(db_dst):
+                shutil.copy2(db_src, db_dst)
+                log(f"Copied .db to run_location: {db_dst}")
+            db_name = os.path.splitext(os.path.basename(db_src))[0]
+            mapdl.resume(db_name, "db")
+            log(f"Resumed: {db_name}")
+
+            mapdl.prep7()
+
+            log("Merging duplicate nodes...")
+            mapdl.nummrg("NODE", opts["node_tol"])
+
+            log("Processing tie (CE) conditions and loads...")
+            mapdl_ops.handle_ties_and_loads(mapdl, log, is_submodel=job.is_submodel)
+
+            log("Removing unused material properties...")
+            mapdl_ops.remove_unused_mats(mapdl, log)
+
+            mapdl.allsel("ALL")
+
+            db_name = "clean_model"
+            log(f"Saving cleaned model as {db_name}.db ...")
+            mapdl.save(db_name, "db")
+            log(f"{db_name}.db saved.")
+
+            cdb_name = "clean_model"
+            is_full_run = not opts["stop_after_step1"]
+            user_wants_unblocked = opts["cdwrite_unblocked"]
+            use_unblocked = user_wants_unblocked and not is_full_run
+            if user_wants_unblocked and is_full_run:
+                log(
+                    "  (UNBLOCKED requested, but full Step 2 run requires "
+                    "BLOCKED for the CDB parser — overriding.)"
+                )
+            fmat = "UNBLOCKED" if use_unblocked else ""
+            log(
+                f"Writing {cdb_name}.cdb "
+                f"({'UNBLOCKED' if use_unblocked else 'BLOCKED'} format) ..."
+            )
+            mapdl.cdwrite("DB", cdb_name, "cdb", fmat=fmat)
+            log("CDWRITE complete.")
+
+            if not use_unblocked:
+                cdb_path = os.path.join(out_dir, f"{cdb_name}.cdb")
+                expanded = cdb_utils.expand_etblock(cdb_path)
+                if expanded:
+                    log(f"  Expanded ETBLOCK -> {expanded} ET/KEYOPT card(s).")
+                rewritten = cdb_utils.rewrite_mp_mpdata_to_classic(cdb_path)
+                if rewritten:
+                    log(
+                        f"  Rewrote {rewritten} MP/MPDATA line(s) to "
+                        f"classic format (abaqus fromansys compatible)."
+                    )
+
+            self._export_step1_metadata(mapdl, job, opts, log)
+
+        finally:
+            try:
+                mapdl.exit()
+            except Exception:
+                try:
+                    mapdl.exit(force=True)
+                except Exception as e:
+                    log(f"MAPDL exit warning: {e}")
+            log("MAPDL closed.")
+
+    def _export_step1_metadata(self, mapdl, job, opts, log):
+        """Save nset/material metadata from MAPDL to text files."""
+        nset_path = os.path.join(job.data_dir, "step1_nsets.txt")
+        mplist_path = os.path.join(job.data_dir, "step1_mplist.txt")
+
+        nset_data = mapdl_ops.collect_nset_data(
+            mapdl, log,
+            is_submodel=job.is_submodel,
+            symmetry_mode=opts["symmetry_mode"],
+        )
+        with open(nset_path, "w") as f:
+            for name, ids in nset_data.items():
+                f.write(f"[{name}]\n")
+                for i in range(0, len(ids), 16):
+                    f.write(", ".join(str(v) for v in ids[i:i + 16]) + "\n")
+                f.write("\n")
+        log(f"Saved nset metadata: {nset_path}")
+
+        mapdl_ops.dump_mapdl_mplist(mapdl, mplist_path)
+        log(f"Saved material metadata: {mplist_path}")
+
+    def _step2_build_inp(self, job, opts, cdb_path, log):
+        """CDB 직접 파싱 → Abaqus INP 템플릿 생성."""
+        log("\n=== Step 2: direct text INP build (no fromansys) ===")
+
+        out_dir = os.path.dirname(job.db_path)
+        data_dir = job.data_dir
+        inp_stem = os.path.splitext(os.path.basename(job.db_path))[0]
+        inp_path = os.path.join(out_dir, f"{inp_stem}.inp")
+
+        init_temp = opts["init_temp"]
+        final_temp = opts["final_temp"]
+        ortho_mat_range = opts["ortho_mat_range"]
 
         nodes = cdb_utils.parse_cdb_nodes(cdb_path)
         elems_by_mat = cdb_utils.parse_cdb_elements_by_mat(cdb_path)
@@ -523,22 +776,22 @@ class ConverterApp:
         if not elems_by_mat:
             raise RuntimeError("EBLOCK에서 요소를 읽지 못했습니다.")
 
-        utils.log_node_coordinate_stats(nodes, "NBLOCK raw", self._log)
+        utils.log_node_coordinate_stats(nodes, "NBLOCK raw", log)
         nodes = utils.scale_nodes(nodes, 1000.0)
-        utils.log_node_coordinate_stats(nodes, "Scaled x1000", self._log)
-        self._log("Applied coordinate scale-up: x1000")
+        utils.log_node_coordinate_stats(nodes, "Scaled x1000", log)
+        log("Applied coordinate scale-up: x1000")
 
         inp_writer.write_template_inp(
-            inp_path, nodes, elems_by_mat, mat_ids, nsets, mat_info, self._log,
-            is_submodel=self.is_submodel.get(),
-            symmetry_mode=self._symmetry_key(),
+            inp_path, nodes, elems_by_mat, mat_ids, nsets, mat_info, log,
+            is_submodel=job.is_submodel,
+            symmetry_mode=opts["symmetry_mode"],
             init_temp=init_temp,
             final_temp=final_temp,
-            has_orthotropic=self.has_orthotropic.get(),
+            has_orthotropic=opts["has_orthotropic"],
             ortho_mat_range=ortho_mat_range,
         )
-        self._log(f"INP created: {inp_path}")
-        self._log(
+        log(f"INP created: {inp_path}")
+        log(
             "NOTE: 재료 상세(온도의존/ENG CONSTANTS/CTE)는 템플릿 자리만 생성됩니다. "
             "실제 값은 INP에서 채워주세요."
         )
