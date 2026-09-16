@@ -5,7 +5,7 @@ parent 프레임 안에 임베드할 수 있도록 ``build_gui(parent)`` 를 추
 """
 
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox
+from tkinter import filedialog, scrolledtext, messagebox, ttk
 import threading
 import queue
 import os
@@ -89,18 +89,61 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
      코어/라이선스/메모리 여유를 보고 값을 정하세요.
    - 병렬 실행 중에는 로그 줄 앞에 [모델명] 이 붙어 어느 파일의 로그인지
      구분됩니다.
+
+12. 파일명 필터 (Name starts with / ends with)
+   - 일괄 모드에서 확장자를 뺀 파일명 기준으로 앞/뒤를 걸러냅니다.
+     대소문자는 구분하지 않고, 비워 두면 필터 없이 전부 대상입니다.
+   - 둘 다 채우면 AND 조건입니다 (앞도 맞고 뒤도 맞는 파일만).
+   - 예: starts="pkg_", ends="_sub" -> pkg_a_sub.db 는 대상, pkg_a.db 는 제외.
+
+13. Target Files 목록 / 진행 상황
+   - 설정을 바꿀 때마다 아래 Target Files 표에 실제 변환 대상이 미리 표시됩니다
+     (파일명 / Sub 여부 / 상태 / 만들어질 .inp 이름 / 원본 폴더).
+   - 실행하면 상태가 Pending -> Running -> Done / Failed / Cancelled 로 바뀌고,
+     표 아래 진행 막대와 "n / N finished" 로 전체 진행률을 볼 수 있습니다.
+
+14. Stop 버튼
+   - 아직 시작하지 않은 파일은 즉시 Cancelled 로 넘어갑니다.
+   - 이미 MAPDL 로 들어간 파일은 진행 중인 MAPDL 명령이 끝나는 시점
+     (노드 병합 / tie 처리 / 재질 정리 등 단계 경계)에 멈춥니다. 명령 하나가
+     오래 걸리면 그만큼 늦게 반응합니다.
+   - 중단된 파일의 .inp 는 만들어지지 않습니다.
+
+15. INP 출력 폴더와 파일명
+   - 일괄 모드에서는 결과 .inp 를 원본 옆이 아니라 한 폴더에 모읍니다.
+     기본 위치는 선택한 폴더의 바깥(상위) 경로에 만드는 "<폴더명>_inp" 이고,
+     File Selection 의 "INP output" 칸에서 다른 곳으로 바꿀 수 있습니다.
+   - 파일명 뒤에는 그 .db 가 들어 있던 폴더 이름이 붙습니다.
+     예: D:/work/caseA/model.db -> D:/work/caseA_inp/model_caseA.inp
+     하위 폴더까지 훑을 때 서로 다른 폴더의 같은 이름을 구분하기 위한 규칙이며,
+     그래도 겹치면 _2, _3 이 붙습니다.
+   - 단일 파일 모드는 기존과 같이 .db 옆에 <모델명>.inp 로 만듭니다.
 """
+
+
+# Target Files 목록에 찍히는 상태값
+ST_PENDING = "Pending"
+ST_RUNNING = "Running"
+ST_DONE = "Done"
+ST_FAILED = "Failed"
+ST_CANCELLED = "Cancelled"
+
+
+class _Aborted(Exception):
+    """Stop 버튼으로 중단됐을 때 파이프라인이 빠져나오는 신호."""
 
 
 class _Job:
     """변환할 .db 파일 하나에 대한 실행 정보."""
 
-    __slots__ = ("db_path", "data_dir", "is_submodel", "prefix")
+    __slots__ = ("db_path", "data_dir", "is_submodel", "prefix", "inp_path")
 
-    def __init__(self, db_path, data_dir, is_submodel, prefix=""):
+    def __init__(self, db_path, data_dir, is_submodel, inp_path, prefix=""):
         self.db_path = db_path
         self.data_dir = data_dir
         self.is_submodel = is_submodel
+        # 결과 .inp 전체 경로 (일괄 모드에서는 모아두는 폴더 안)
+        self.inp_path = inp_path
         # 병렬 실행 시 로그 줄 앞에 붙일 "[모델명] " 표시
         self.prefix = prefix
 
@@ -112,7 +155,7 @@ class ConverterApp:
         self.root = root
         if isinstance(root, (tk.Tk, tk.Toplevel)):
             root.title("ANSYS → Abaqus Converter")
-            root.geometry("720x980")
+            root.geometry("900x980")
             root.resizable(False, False)
 
         self.db_path = tk.StringVar()
@@ -120,6 +163,11 @@ class ConverterApp:
         self.input_mode = tk.StringVar(value="file")
         self.batch_dir = tk.StringVar()
         self.batch_recursive = tk.BooleanVar(value=False)
+        # 파일명(확장자 제외) 기준 앞/뒤 필터. 비워 두면 전부 대상.
+        self.name_starts = tk.StringVar()
+        self.name_ends = tk.StringVar()
+        # 일괄 모드에서 .inp 를 모아 둘 폴더 (선택 폴더의 바깥 경로에 자동 생성)
+        self.inp_out_root = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.data_dir = tk.StringVar()
         self.node_tol = tk.StringVar(value="1e-6")
@@ -154,9 +202,23 @@ class ConverterApp:
         # 두 인스턴스가 동시에 포트를 잡으려다 충돌하지 않도록 MAPDL 기동만 직렬화한다.
         # (기동 후 무거운 작업은 그대로 병렬로 돈다.)
         self._launch_lock = threading.Lock()
+        # Stop 버튼 신호 + 실행 중 여부
+        self._stop_event = threading.Event()
+        self._running = False
+        # 파일별 상태 갱신도 작업 스레드에서 오므로 큐를 거쳐 메인 스레드에서 반영한다.
+        self._status_queue = queue.Queue()
+        self._job_status = {}
+        self._file_rows = {}
+
         self.db_path.trace_add("write", self._on_db_path_change)
         self._build_ui()
         self._on_input_mode_change()
+        for var in (self.batch_dir, self.name_starts, self.name_ends):
+            var.trace_add("write", self._on_filter_change)
+        self.batch_recursive.trace_add("write", self._on_filter_change)
+        self.db_path.trace_add("write", self._on_filter_change)
+        self.is_submodel.trace_add("write", self._on_filter_change)
+        self._refresh_file_list()
         self.root.after(120, self._drain_log)
 
     # -----------------------------------------------------------------------
@@ -191,10 +253,39 @@ class ConverterApp:
         self.btn_browse_dir = tk.Button(frm_file, text="Browse", command=self._browse_dir)
         self.btn_browse_dir.grid(row=2, column=2, pady=(3, 0))
 
+        frm_filter = tk.Frame(frm_file)
+        frm_filter.grid(row=3, column=0, columnspan=3, sticky="w")
         self.chk_recursive = tk.Checkbutton(
-            frm_file, text="Include subfolders", variable=self.batch_recursive,
+            frm_filter, text="Include subfolders", variable=self.batch_recursive,
         )
-        self.chk_recursive.grid(row=3, column=1, sticky="w")
+        self.chk_recursive.pack(side="left")
+        self.lbl_starts = tk.Label(frm_filter, text="Name starts with:")
+        self.lbl_starts.pack(side="left", padx=(15, 3))
+        self.ent_starts = tk.Entry(frm_filter, textvariable=self.name_starts, width=16)
+        self.ent_starts.pack(side="left")
+        self.lbl_ends = tk.Label(frm_filter, text="ends with:")
+        self.lbl_ends.pack(side="left", padx=(12, 3))
+        self.ent_ends = tk.Entry(frm_filter, textvariable=self.name_ends, width=16)
+        self.ent_ends.pack(side="left")
+        self.lbl_filter_hint = tk.Label(
+            frm_filter, text="(filename without .db, case-insensitive; blank = no filter)",
+            fg="#555555",
+        )
+        self.lbl_filter_hint.pack(side="left", padx=(8, 0))
+
+        self.lbl_out_root = tk.Label(frm_file, text="INP output:")
+        self.lbl_out_root.grid(row=4, column=0, sticky="w", pady=(3, 0))
+        self.ent_out_root = tk.Entry(frm_file, textvariable=self.inp_out_root, width=55)
+        self.ent_out_root.grid(row=4, column=1, padx=5, pady=(3, 0))
+        self.btn_browse_out = tk.Button(frm_file, text="Browse", command=self._browse_out_root)
+        self.btn_browse_out.grid(row=4, column=2, pady=(3, 0))
+        self.lbl_out_hint = tk.Label(
+            frm_file,
+            text="Batch mode gathers every .inp here (default: <parent of the selected folder>"
+                 "/<folder>_inp). Each file is named <model>_<its folder>.inp",
+            fg="#555555",
+        )
+        self.lbl_out_hint.grid(row=5, column=1, columnspan=2, sticky="w")
 
         self.chk_submodel = tk.Checkbutton(
             frm_file,
@@ -202,7 +293,7 @@ class ConverterApp:
                  "auto-set when filename ends with 'sub'. Batch mode decides per file.)",
             variable=self.is_submodel,
         )
-        self.chk_submodel.grid(row=4, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        self.chk_submodel.grid(row=6, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
         frm_set = tk.LabelFrame(self.root, text="Settings", padx=10, pady=5)
         frm_set.pack(fill="x", padx=10, pady=5)
@@ -292,14 +383,50 @@ class ConverterApp:
         self.btn_notes = tk.Button(
             frm_run, text="Notes / Help", command=self._show_notes, width=14, height=1,
         )
+        self.btn_stop = tk.Button(
+            frm_run, text="Stop", command=self._stop, width=10, height=1, state="disabled",
+            bg="#B03A2E", fg="white", activebackground="#C0503E", activeforeground="white",
+            disabledforeground="#DDDDDD",
+        )
         self.btn_run.pack(side="right")
+        self.btn_stop.pack(side="right", padx=(0, 8))
         self.btn_show_step1.pack(side="right", padx=(0, 8))
         self.btn_notes.pack(side="right", padx=(0, 8))
+
+        frm_files = tk.LabelFrame(self.root, text="Target Files", padx=10, pady=5)
+        frm_files.pack(fill="both", expand=True, padx=10, pady=5)
+
+        tree_wrap = tk.Frame(frm_files)
+        tree_wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            tree_wrap, columns=("name", "sub", "status", "out", "folder"),
+            show="headings", height=5,
+        )
+        for col, text, width, anchor in (
+            ("name", "File", 210, "w"),
+            ("sub", "Sub", 40, "center"),
+            ("status", "Status", 80, "center"),
+            ("out", "Output .inp", 230, "w"),
+            ("folder", "Source folder", 260, "w"),
+        ):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, anchor=anchor, stretch=(col == "folder"))
+        tree_scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+
+        frm_prog = tk.Frame(frm_files)
+        frm_prog.pack(fill="x", pady=(5, 0))
+        self.progress = ttk.Progressbar(frm_prog, mode="determinate", maximum=1, value=0)
+        self.progress.pack(side="left", fill="x", expand=True)
+        self.lbl_progress = tk.Label(frm_prog, text="No target file", width=42, anchor="w")
+        self.lbl_progress.pack(side="left", padx=(10, 0))
 
         frm_log = tk.LabelFrame(self.root, text="Log", padx=10, pady=5)
         frm_log.pack(fill="both", expand=True, padx=10, pady=(5, 10))
 
-        self.log = scrolledtext.ScrolledText(frm_log, height=15, state="disabled", wrap="word")
+        self.log = scrolledtext.ScrolledText(frm_log, height=8, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True)
 
     # -----------------------------------------------------------------------
@@ -325,6 +452,19 @@ class ConverterApp:
         if path:
             self.batch_dir.set(path)
             self.output_dir.set(path)
+            self.inp_out_root.set(self._default_inp_out_root(path))
+
+    def _browse_out_root(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.inp_out_root.set(path)
+
+    @staticmethod
+    def _default_inp_out_root(folder):
+        """선택한 폴더의 바깥(상위) 경로에 '<폴더명>_inp' 를 만든다."""
+        folder = os.path.abspath(folder)
+        parent = os.path.dirname(folder)
+        return os.path.join(parent or folder, os.path.basename(folder) + "_inp")
 
     def _is_batch(self):
         return self.input_mode.get() == "folder"
@@ -336,8 +476,16 @@ class ConverterApp:
         dir_state = "normal" if batch else "disabled"
         for w in (self.ent_db, self.btn_browse_db, self.chk_submodel):
             w.config(state=file_state)
-        for w in (self.ent_dir, self.btn_browse_dir, self.chk_recursive):
+        for w in (self.ent_dir, self.btn_browse_dir, self.chk_recursive,
+                  self.ent_starts, self.ent_ends, self.ent_out_root, self.btn_browse_out):
             w.config(state=dir_state)
+        for w in (self.lbl_starts, self.lbl_ends, self.lbl_filter_hint,
+                  self.lbl_out_root, self.lbl_out_hint):
+            w.config(state=dir_state)
+        self._refresh_file_list()
+
+    def _on_filter_change(self, *_args):
+        self._refresh_file_list()
 
     def _on_db_path_change(self, *_args):
         """Auto-toggle Sub-model when the .db filename ends with 'sub' (case-insensitive)."""
@@ -364,7 +512,90 @@ class ConverterApp:
         # Step 1 이 만들어 둔 중간 결과물은 입력으로 다시 잡지 않는다.
         found = [f for f in found
                  if os.path.splitext(os.path.basename(f))[0].lower() != "clean_model"]
+        found = [f for f in found if self._name_matches_filter(f)]
         return sorted(found, key=lambda f: os.path.basename(f).lower())
+
+    def _name_matches_filter(self, db_path):
+        """파일명(확장자 제외) 앞/뒤 필터. 대소문자 무시, 빈 칸은 통과."""
+        stem = os.path.splitext(os.path.basename(db_path))[0].lower()
+        starts = self.name_starts.get().strip().lower()
+        ends = self.name_ends.get().strip().lower()
+        if starts and not stem.startswith(starts):
+            return False
+        if ends and not stem.endswith(ends):
+            return False
+        return True
+
+    # -----------------------------------------------------------------------
+    # Target Files 목록 / 진행 상황
+    # -----------------------------------------------------------------------
+
+    def _refresh_file_list(self, *_args):
+        """현재 설정으로 무엇이 변환 대상인지 미리 보여준다 (실행 중에는 건드리지 않음)."""
+        if self._running:
+            return
+        if self._is_batch() and not self.inp_out_root.get().strip():
+            folder = self.batch_dir.get().strip()
+            if folder and os.path.isdir(folder):
+                self.inp_out_root.set(self._default_inp_out_root(folder))
+        try:
+            jobs = self._collect_jobs()
+        except ValueError:
+            jobs = []
+        self._populate_file_list(jobs)
+
+    def _populate_file_list(self, jobs):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._file_rows = {}
+        self._job_status = {}
+        for job in jobs:
+            item = self.tree.insert("", "end", values=(
+                os.path.basename(job.db_path),
+                "Y" if job.is_submodel else "",
+                ST_PENDING,
+                os.path.basename(job.inp_path),
+                os.path.dirname(job.db_path),
+            ))
+            self._file_rows[job.db_path] = item
+            self._job_status[job.db_path] = ST_PENDING
+        self._update_progress()
+
+    def _set_status(self, db_path, status):
+        """작업 스레드에서 호출 — 큐를 통해 메인 스레드가 반영한다."""
+        self._status_queue.put((db_path, status))
+
+    def _apply_status(self, db_path, status):
+        self._job_status[db_path] = status
+        item = self._file_rows.get(db_path)
+        if item:
+            self.tree.set(item, "status", status)
+            self.tree.see(item)
+
+    def _update_progress(self):
+        total = len(self._job_status)
+        if not total:
+            self.progress.config(maximum=1, value=0)
+            self.lbl_progress.config(text="No target file")
+            return
+        counts = {st: 0 for st in (ST_PENDING, ST_RUNNING, ST_DONE, ST_FAILED, ST_CANCELLED)}
+        for st in self._job_status.values():
+            counts[st] = counts.get(st, 0) + 1
+        finished = counts[ST_DONE] + counts[ST_FAILED] + counts[ST_CANCELLED]
+        self.progress.config(maximum=total, value=finished)
+        text = f"{finished} / {total} finished"
+        if not self._running and finished == 0:
+            text = f"{total} file(s) to convert"
+        extra = []
+        if counts[ST_RUNNING]:
+            extra.append(f"{counts[ST_RUNNING]} running")
+        if counts[ST_FAILED]:
+            extra.append(f"{counts[ST_FAILED]} failed")
+        if counts[ST_CANCELLED]:
+            extra.append(f"{counts[ST_CANCELLED]} cancelled")
+        if extra:
+            text += " (" + ", ".join(extra) + ")"
+        self.lbl_progress.config(text=text)
 
     def _parse_ortho_mat_range(self):
         text = self.ortho_mat_range.get().strip()
@@ -430,15 +661,28 @@ class ConverterApp:
                 lines.append(self._log_queue.get_nowait())
         except queue.Empty:
             pass
+        updates = []
+        try:
+            while True:
+                updates.append(self._status_queue.get_nowait())
+        except queue.Empty:
+            pass
         try:
             if lines:
                 self.log.config(state="normal")
                 self.log.insert("end", "\n".join(lines) + "\n")
                 self.log.see("end")
                 self.log.config(state="disabled")
+            for db_path, status in updates:
+                self._apply_status(db_path, status)
+            if updates:
+                self._update_progress()
             if self._batch_done.is_set():
                 self._batch_done.clear()
+                self._running = False
                 self.btn_run.config(state="normal")
+                self.btn_stop.config(state="disabled")
+                self._update_progress()
             self.root.after(120, self._drain_log)
         except tk.TclError:
             # 창이 닫혀 위젯이 사라진 경우 — 반복을 멈춘다.
@@ -468,8 +712,26 @@ class ConverterApp:
 
         for job in jobs:
             os.makedirs(job.data_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(job.inp_path), exist_ok=True)
+
+        self._populate_file_list(jobs)
+        self._stop_event.clear()
+        self._running = True
         self.btn_run.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self._update_progress()
         threading.Thread(target=self._run_batch, args=(jobs, opts), daemon=True).start()
+
+    def _stop(self):
+        """실행 중인 작업에 중단을 요청한다."""
+        if not self._running:
+            return
+        self._stop_event.set()
+        self.btn_stop.config(state="disabled")
+        self._log(
+            "\n*** Stop requested — queued files are cancelled; a file already inside "
+            "MAPDL stops as soon as its current command returns. ***"
+        )
 
     def _collect_jobs(self):
         """실행 모드에 맞춰 변환할 파일 목록(_Job)을 만든다."""
@@ -482,19 +744,26 @@ class ConverterApp:
             db_files = self._collect_db_files(folder)
             if not db_files:
                 raise ValueError(f"No .db file found in: {folder}")
+            out_root = self.inp_out_root.get().strip() or self._default_inp_out_root(folder)
+            out_root = os.path.abspath(out_root)
             self.output_dir.set(folder)
             self.data_dir.set(os.path.join(folder, "_data"))
-            return [
-                _Job(
-                    db_path=os.path.abspath(f),
+
+            jobs = []
+            used_names = set()
+            for f in db_files:
+                f = os.path.abspath(f)
+                stem = os.path.splitext(os.path.basename(f))[0]
+                inp_name = self._unique_inp_name(stem, os.path.dirname(f), used_names)
+                jobs.append(_Job(
+                    db_path=f,
                     # 파일끼리 중간 산출물이 섞이지 않도록 모델별 폴더를 쓴다.
-                    data_dir=os.path.join(os.path.dirname(os.path.abspath(f)), "_data",
-                                          os.path.splitext(os.path.basename(f))[0]),
+                    data_dir=os.path.join(os.path.dirname(f), "_data", stem),
                     is_submodel=self._auto_submodel(f),
-                    prefix=f"[{os.path.splitext(os.path.basename(f))[0]}] ",
-                )
-                for f in db_files
-            ]
+                    inp_path=os.path.join(out_root, inp_name),
+                    prefix=f"[{stem}] ",
+                ))
+            return jobs
 
         db_path = self.db_path.get().strip()
         if not db_path:
@@ -510,8 +779,22 @@ class ConverterApp:
             db_path=db_path,
             data_dir=data_dir,
             is_submodel=self.is_submodel.get(),
+            inp_path=os.path.join(out_dir, os.path.splitext(os.path.basename(db_path))[0] + ".inp"),
             prefix="",
         )]
+
+    @staticmethod
+    def _unique_inp_name(stem, src_folder, used_names):
+        """<모델명>_<들어있던 폴더명>.inp — 한 폴더에 모으므로 이름이 겹치면 번호를 붙인다."""
+        folder_name = os.path.basename(src_folder.rstrip(os.sep)) or "root"
+        base = f"{stem}_{folder_name}"
+        name = f"{base}.inp"
+        n = 2
+        while name.lower() in used_names:
+            name = f"{base}_{n}.inp"
+            n += 1
+        used_names.add(name.lower())
+        return name
 
     def _collect_options(self):
         """작업 스레드에서 tk 변수를 읽지 않도록 설정값을 미리 스냅샷한다."""
@@ -573,10 +856,14 @@ class ConverterApp:
         try:
             workers = min(opts["max_jobs"], len(jobs))
             if len(jobs) > 1:
-                self._log(
-                    f"=== Batch: {len(jobs)} file(s), "
-                    f"{workers} at a time ==="
-                )
+                self._log(f"=== Batch: {len(jobs)} file(s), {workers} at a time ===")
+                self._log(f"    INP output folder: {os.path.dirname(jobs[0].inp_path)}")
+                for job in jobs:
+                    self._log(
+                        f"    - {os.path.basename(job.db_path)}"
+                        f"{' (submodel)' if job.is_submodel else ''}"
+                        f"  ->  {os.path.basename(job.inp_path)}"
+                    )
             if workers <= 1:
                 results = [self._run_pipeline(job, opts) for job in jobs]
             else:
@@ -584,15 +871,23 @@ class ConverterApp:
                     results = list(pool.map(lambda j: self._run_pipeline(j, opts), jobs))
 
             if len(jobs) > 1:
-                failed = [r for r in results if not r[1]]
+                done = [r for r in results if r[1] == ST_DONE]
+                failed = [r for r in results if r[1] == ST_FAILED]
+                cancelled = [r for r in results if r[1] == ST_CANCELLED]
                 self._log(
-                    f"\n=== Batch done: {len(results) - len(failed)} succeeded, "
-                    f"{len(failed)} failed ==="
+                    f"\n=== Batch finished: {len(done)} done, {len(failed)} failed, "
+                    f"{len(cancelled)} cancelled ==="
                 )
-                for job, _ok, err in failed:
+                for job, _st, err in failed:
                     self._log(f"  FAILED {os.path.basename(job.db_path)}: {err}")
+                for job, _st, _err in cancelled:
+                    self._log(f"  CANCELLED {os.path.basename(job.db_path)}")
         finally:
             self._batch_done.set()
+
+    def _raise_if_stopped(self):
+        if self._stop_event.is_set():
+            raise _Aborted()
 
     def _run_pipeline(self, job, opts):
         """파일 하나를 변환한다. 예외는 삼켜서 (job, ok, err) 로 돌려준다."""
@@ -606,19 +901,32 @@ class ConverterApp:
                 for line in str(msg).split("\n")
             ))
 
+        if self._stop_event.is_set():
+            self._set_status(job.db_path, ST_CANCELLED)
+            return (job, ST_CANCELLED, None)
+
+        self._set_status(job.db_path, ST_RUNNING)
         try:
             log(f"\n=== Converting: {job.db_path} ===")
             self._step1_cleanup(job, opts, log)
             if opts["stop_after_step1"]:
                 log("=== Stopped after Step 1 ===")
-                return (job, True, None)
+                self._set_status(job.db_path, ST_DONE)
+                return (job, ST_DONE, None)
+            self._raise_if_stopped()
             cdb_path = os.path.join(job.data_dir, "clean_model.cdb")
             self._step2_build_inp(job, opts, cdb_path, log)
             log("=== All steps completed ===")
-            return (job, True, None)
+            self._set_status(job.db_path, ST_DONE)
+            return (job, ST_DONE, None)
+        except _Aborted:
+            log("=== Cancelled by Stop ===")
+            self._set_status(job.db_path, ST_CANCELLED)
+            return (job, ST_CANCELLED, None)
         except Exception as e:
             log(f"[ERROR] {e}")
-            return (job, False, e)
+            self._set_status(job.db_path, ST_FAILED)
+            return (job, ST_FAILED, e)
 
     def _step1_cleanup(self, job, opts, log):
         """PyMAPDL: cleanup model and CDWRITE."""
@@ -628,8 +936,10 @@ class ConverterApp:
 
         out_dir = job.data_dir
         os.makedirs(out_dir, exist_ok=True)
+        self._raise_if_stopped()
 
         with self._launch_lock:
+            self._raise_if_stopped()
             mapdl = launch_mapdl(
                 run_location=out_dir,
                 override=True,
@@ -662,12 +972,15 @@ class ConverterApp:
 
             log("Merging duplicate nodes...")
             mapdl.nummrg("NODE", opts["node_tol"])
+            self._raise_if_stopped()
 
             log("Processing tie (CE) conditions and loads...")
             mapdl_ops.handle_ties_and_loads(mapdl, log, is_submodel=job.is_submodel)
+            self._raise_if_stopped()
 
             log("Removing unused material properties...")
             mapdl_ops.remove_unused_mats(mapdl, log)
+            self._raise_if_stopped()
 
             mapdl.allsel("ALL")
 
@@ -742,10 +1055,9 @@ class ConverterApp:
         """CDB 직접 파싱 → Abaqus INP 템플릿 생성."""
         log("\n=== Step 2: direct text INP build (no fromansys) ===")
 
-        out_dir = os.path.dirname(job.db_path)
         data_dir = job.data_dir
-        inp_stem = os.path.splitext(os.path.basename(job.db_path))[0]
-        inp_path = os.path.join(out_dir, f"{inp_stem}.inp")
+        inp_path = job.inp_path
+        os.makedirs(os.path.dirname(inp_path), exist_ok=True)
 
         init_temp = opts["init_temp"]
         final_temp = opts["final_temp"]
