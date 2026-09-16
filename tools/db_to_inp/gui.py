@@ -142,6 +142,11 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
      .out 에서 실제 리슨 포트를 읽어 그 포트로 다시 붙어 그대로 진행합니다
      (로그의 "Attached to MAPDL on port ..." 줄).
    - 포트를 정확히 읽기 위해 기동 전에 이전 실행의 .out/.err/.lock 을 지웁니다.
+   - 프록시 환경변수(http_proxy/https_proxy)가 있으면 grpc 가 127.0.0.1 접속까지
+     프록시로 보내 버려, MAPDL 이 정상적으로 리스닝 중인데도 접속에 실패합니다.
+     그래서 기동 전에 로컬만 프록시를 우회하도록 맞춰 둡니다
+     (GRPC_ENABLE_HTTP_PROXY=0, NO_PROXY 에 localhost/127.0.0.1/::1 추가).
+     이 설정은 이 프로그램이 도는 동안에만 적용되고 시스템에는 영향이 없습니다.
    - 변환기와 무관하게 PyMAPDL + ANSYS 설치만 점검하려면
      "python scripts/mapdl_smoke_test.py" 를 돌려 보세요. 거기서도 실패하면
      원인은 변환기 코드가 아닙니다.
@@ -168,6 +173,9 @@ ANSYS_DEFAULT_LANG = "en-us"
 # MAPDL 이 CADOE_LIBDIR<버전> 아래에서 찾는 리소스 파일. 이 파일이 있는 폴더가
 # CADOE_LIBDIR 의 올바른 값이다.
 CADOE_PROBE_FILE = "fx0.msb"
+# MAPDL gRPC 는 항상 이 PC 안에서만 오가므로 프록시를 타면 안 된다.
+PROXY_VARS = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
+LOCAL_NO_PROXY = ("localhost", "127.0.0.1", "::1")
 # MAPDL 이 .out 에 남기는 실제 gRPC 리슨 포트.
 GRPC_LISTEN_RE = re.compile(r"Server\s+listening\s+on\s*:?\s*[\d.]+:(\d+)", re.I)
 
@@ -184,8 +192,10 @@ MAPDL 접속에 실패했습니다. 위에 찍힌 .out/.err 내용이 진짜 원
     문제입니다. Version 값이 실제 설치된 버전과 같은지 확인하고, 같은 버전을
     직접(ANSYS Mechanical APDL Launcher) 띄워 정상 실행되는지부터 보세요.
     환경변수 AWP_ROOT<버전> 이 맞아야 합니다.
-  · 프로세스는 뜨는데 접속만 안 되면 방화벽/보안 프로그램이 로컬 gRPC 포트를
-    막고 있을 수 있습니다.
+  · 프로세스는 뜨는데 접속만 안 되면, 먼저 프록시 환경변수를 의심하세요.
+    grpc 는 http_proxy/https_proxy 를 읽어 127.0.0.1 접속까지 프록시로 보냅니다.
+    실행 직전에 자동으로 우회하지만(GRPC_ENABLE_HTTP_PROXY=0 + NO_PROXY),
+    그래도 안 되면 방화벽/보안 프로그램이 로컬 포트를 막는 경우입니다.
   그 밖에 확인할 것:
   1) 이전 실행에서 남은 ANSYS/MAPDL 프로세스 (작업 관리자에서 모두 종료,
      또는 명령 프롬프트에서  taskkill /F /IM ANSYS.exe /T ).
@@ -281,6 +291,8 @@ class ConverterApp:
         self._active_mapdl = set()
         # 우리가 띄운 MAPDL 프로세스 PID — Stop / 종료 시 확실히 죽이기 위한 것.
         self._spawned_pids = set()
+        # MAPDL 기동용 환경변수 정리는 세션당 한 번만.
+        self._env_prepared = False
         atexit.register(self._exit_all_mapdl)
         # Stop 버튼 신호 + 실행 중 여부
         self._stop_event = threading.Event()
@@ -1171,6 +1183,42 @@ class ConverterApp:
             log(f"  ANSYS_LANG was not set — using '{lang}' for this session.")
         self._ensure_cadoe_libdir(opts, log)
 
+    @staticmethod
+    def _bypass_proxy_for_local_grpc(log):
+        """로컬 gRPC 접속이 회사 프록시로 새지 않게 막는다.
+
+        grpc 는 http_proxy/https_proxy 환경변수를 읽어 127.0.0.1 접속까지
+        프록시로 보낸다(requests 와 달리 루프백을 자동으로 빼 주지 않는다).
+        프록시가 내부 접속을 막으면 MAPDL 이 정상적으로 리스닝 중인데도
+        "unable to connect to MAPDL grpc instance" 로 끝난다.
+        """
+        found = [v for v in PROXY_VARS if os.environ.get(v, "").strip()]
+        if not found:
+            return
+        if not os.environ.get("GRPC_ENABLE_HTTP_PROXY", "").strip():
+            os.environ["GRPC_ENABLE_HTTP_PROXY"] = "0"
+        for var in ("NO_PROXY", "no_proxy"):
+            hosts = [h.strip() for h in os.environ.get(var, "").split(",") if h.strip()]
+            hosts += [h for h in LOCAL_NO_PROXY if h not in hosts]
+            os.environ[var] = ",".join(hosts)
+        log(
+            f"  Proxy env detected ({', '.join(found)}) — bypassing it for the "
+            f"local MAPDL gRPC connection (GRPC_ENABLE_HTTP_PROXY=0, "
+            f"NO_PROXY+={','.join(LOCAL_NO_PROXY)})."
+        )
+
+    def _prepare_mapdl_env(self, opts, log):
+        """MAPDL 기동에 필요한 환경변수를 한 번만 정리한다.
+
+        grpc 는 채널을 만들 때 프록시 환경변수를 읽으므로, ansys.mapdl.core
+        (=grpc) 를 import 하기 전에 불러야 한다.
+        """
+        if self._env_prepared:
+            return
+        self._env_prepared = True
+        self._bypass_proxy_for_local_grpc(log)
+        self._ensure_ansys_lang(opts, log)
+
     def _ensure_cadoe_libdir(self, opts, log):
         """CADOE_LIBDIR<버전> 이 fx0.msb 가 있는 폴더를 가리키게 맞춘다.
 
@@ -1407,7 +1455,7 @@ class ConverterApp:
             # 기동만 직렬화한다 — 두 인스턴스가 같은 포트를 잡는 것을 막는다.
             with self._launch_lock:
                 self._raise_if_stopped()
-                self._ensure_ansys_lang(opts, log)
+                self._prepare_mapdl_env(opts, log)
                 self._clear_stale_run_files(out_dir, log)
                 kwargs = self._launch_kwargs_for(out_dir, opts, attempt, log)
                 shown = ", ".join(f"{k}={v!r}" for k, v in sorted(kwargs.items())
@@ -1453,6 +1501,11 @@ class ConverterApp:
     def _step1_cleanup(self, job, opts, log):
         """PyMAPDL: cleanup model and CDWRITE."""
         log("=== Step 1: PyMAPDL cleanup + CDWRITE ===")
+
+        # grpc 는 import 이후 채널 생성 시점에 프록시 환경변수를 읽으므로,
+        # ansys.mapdl.core(=grpc) 를 불러오기 전에 환경을 먼저 정리한다.
+        with self._launch_lock:
+            self._prepare_mapdl_env(opts, log)
 
         from ansys.mapdl.core import launch_mapdl
 

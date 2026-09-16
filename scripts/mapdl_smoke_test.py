@@ -58,8 +58,23 @@ def main():
     print("=== 1. 환경변수 ===")
     for var in (f"AWP_ROOT{version}", f"CADOE_LIBDIR{version}", "ANSYS_LANG",
                 "ANSYS_SYSDIR", "ANSYSLMD_LICENSE_FILE",
-                "PYMAPDL_START_INSTANCE", "PYMAPDL_PORT", "PYMAPDL_IP"):
+                "PYMAPDL_START_INSTANCE", "PYMAPDL_PORT", "PYMAPDL_IP",
+                "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                "GRPC_ENABLE_HTTP_PROXY"):
         print(f"  {var} = {os.environ.get(var, '(설정 안 됨)')}")
+
+    # grpc 는 http_proxy/https_proxy 를 읽어 127.0.0.1 접속까지 프록시로 보낸다.
+    # 변환기와 같은 방식으로 로컬만 우회시킨다.
+    proxies = [v for v in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
+               if os.environ.get(v, "").strip()]
+    if proxies:
+        os.environ.setdefault("GRPC_ENABLE_HTTP_PROXY", "0")
+        for var in ("NO_PROXY", "no_proxy"):
+            hosts = [h.strip() for h in os.environ.get(var, "").split(",") if h.strip()]
+            hosts += [h for h in ("localhost", "127.0.0.1", "::1") if h not in hosts]
+            os.environ[var] = ",".join(hosts)
+        print(f"\n  프록시 감지 ({', '.join(proxies)}) — 로컬 gRPC 는 우회하도록 설정함")
+        print("  (이것 없이 실패한다면 원인은 프록시다)")
 
     print("\n=== 2. 포트 ===")
     print(f"  {port}: {'비어 있음' if port_is_free(port) else '사용 중 (다른 것이 물고 있음)'}")
