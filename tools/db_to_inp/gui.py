@@ -136,14 +136,18 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
      .err/.out 내용도 같이 찍습니다. 원인은 대부분 거기에 있습니다.
    - 기동에 실패했거나 Stop 을 눌렀거나 앱을 닫을 때, 우리가 띄운 MAPDL 은
      PID 로 강제 종료(Windows: taskkill /F /T)까지 해서 남기지 않습니다.
-   - MAPDL 이 "resource file ...\Language\/fx0.msb not found" 로 뜨다 마는
-     경우는 ANSYS_LANG 환경변수가 비어 있어서입니다. MAPDL 이 리소스 경로를
-     "...\Language\<ANSYS_LANG>/fx0.msb" 로 조립하는데 가운데가 비면 파일을
-     찾지 못합니다. ANSYS Launcher 로 띄울 때는 런처가 이 값을 넣어 주지만,
-     여기서는 파이썬 프로세스의 환경을 그대로 물려주기 때문에 비어 있을 수
-     있습니다. 그래서 실행 직전에 비어 있으면 설치된 Language 폴더를 보고
-     (없으면 en-us 로) 자동으로 채웁니다.
-     계속 문제가 되면 사용자 환경변수에 ANSYS_LANG=en-us 를 직접 넣어 두세요.
+   - 기동에 쓸 포트는 미리 비어 있는지 확인해서 항상 명시합니다. 기본
+     포트(50052)를 다른 MAPDL 이 물고 있으면 MAPDL 은 스스로 옆 포트로 옮겨
+     가는데 PyMAPDL 은 원래 포트에서 기다리다 접속에 실패하기 때문입니다.
+     실패 시에는 MAPDL 이 .out 에 남긴 실제 리슨 포트를 읽어 어긋났는지
+     알려 줍니다.
+   - "resource file ...\Language\/fx0.msb not found" 는 CADOE_LIBDIR<버전> 이
+     언어 폴더(en-us)까지 안 가고 Language 폴더에서 끊겼다는 뜻입니다. 실행
+     직전에 fx0.msb 가 실제로 있는 폴더를 찾아 바로잡고, ANSYS_LANG 도 비어
+     있으면 채웁니다. 계속 문제가 되면 사용자 환경변수에
+     CADOE_LIBDIR<버전> = ...\Language\en-us 를 직접 넣어 두세요.
+     다만 이 오류가 떠도 MAPDL 이 gRPC 서버를 띄우는 경우가 있어, 접속 실패의
+     진짜 원인이 아닐 수 있습니다.
    - 그 밖에 MAPDL 자체가 내는 오류는 ANSYS 설치/환경 문제입니다. Version 값과
      AWP_ROOT<버전> 환경변수를 보고, 같은 버전을 ANSYS Launcher 로 직접 띄워
      되는지부터 확인하세요.
@@ -157,12 +161,21 @@ MAPDL_PORT_SCAN = 400
 MAPDL_START_TIMEOUT = 120
 # ANSYS_LANG 이 비어 있을 때 쓸 기본 언어 코드 (Language 폴더 하위 폴더 이름).
 ANSYS_DEFAULT_LANG = "en-us"
+# MAPDL 이 CADOE_LIBDIR<버전> 아래에서 찾는 리소스 파일. 이 파일이 있는 폴더가
+# CADOE_LIBDIR 의 올바른 값이다.
+CADOE_PROBE_FILE = "fx0.msb"
+# MAPDL 이 .out 에 남기는 실제 gRPC 리슨 포트.
+GRPC_LISTEN_RE = re.compile(r"Server\s+listening\s+on\s*:?\s*[\d.]+:(\d+)", re.I)
 
 MAPDL_LAUNCH_HINT = """\
 MAPDL 접속에 실패했습니다. 위에 찍힌 .out/.err 내용이 진짜 원인입니다.
-  · "resource file ...\Language\/fx0.msb not found" 는 ANSYS_LANG 이 비어
-    있다는 뜻입니다(경로 가운데 언어 코드가 빠짐). 실행 직전에 자동으로 채우지만,
-    그래도 나면 사용자 환경변수에 ANSYS_LANG=en-us 를 직접 넣고 다시 띄우세요.
+  · "resource file ...\Language\/fx0.msb not found" 는 CADOE_LIBDIR<버전> 이
+    언어 폴더(en-us)까지 안 가고 Language 폴더에서 끊겼다는 뜻입니다. 실행
+    직전에 자동으로 바로잡지만, 그래도 나면 사용자 환경변수에
+    CADOE_LIBDIR<버전> = ...\Language\en-us 를 직접 넣으세요.
+    다만 이 오류가 떠도 MAPDL 이 gRPC 서버를 띄우는 경우가 있어, 접속 실패의
+    진짜 원인이 아닐 수 있습니다. 위의 "MAPDL is listening on port ..." 줄을
+    먼저 보세요.
   · 그 밖에 MAPDL 자체가 기동 중에 낸 오류라면 파이썬이 아니라 ANSYS 설치/환경
     문제입니다. Version 값이 실제 설치된 버전과 같은지 확인하고, 같은 버전을
     직접(ANSYS Mechanical APDL Launcher) 띄워 정상 실행되는지부터 보세요.
@@ -1087,26 +1100,53 @@ class ConverterApp:
         self._kill_leftover_processes()
 
     @staticmethod
-    def _find_ansys_lang(version):
-        """설치된 ANSYS 의 Language 폴더에서 쓸 언어 코드를 찾는다."""
+    def _language_dirs(version):
+        """설치된 ANSYS 에서 Language 폴더 후보를 모은다."""
         root = os.environ.get(f"AWP_ROOT{version}") or os.environ.get("AWP_ROOT")
         if not root or not os.path.isdir(root):
-            return None
-        candidates = [
+            return []
+        return [d for d in (
+            os.path.join(root, "commonfiles", "Language"),
             os.path.join(root, "ansys", "gui", "Language"),
             os.path.join(root, "ansys", "Language"),
-            os.path.join(root, "commonfiles", "Language"),
-        ]
-        for lang_dir in candidates:
-            if not os.path.isdir(lang_dir):
-                continue
-            try:
-                subs = sorted(d for d in os.listdir(lang_dir)
-                              if os.path.isdir(os.path.join(lang_dir, d)))
-            except OSError:
-                continue
-            if ANSYS_DEFAULT_LANG in subs:
-                return ANSYS_DEFAULT_LANG
+        ) if os.path.isdir(d)]
+
+    @staticmethod
+    def _lang_subdirs(lang_dir):
+        """Language 폴더의 하위 언어 폴더를 en-us 우선으로 정렬해 돌려준다."""
+        try:
+            subs = sorted(d for d in os.listdir(lang_dir)
+                          if os.path.isdir(os.path.join(lang_dir, d)))
+        except OSError:
+            return []
+        subs.sort(key=lambda d: (d.lower() != ANSYS_DEFAULT_LANG, d.lower()))
+        return subs
+
+    @classmethod
+    def _find_cadoe_libdir(cls, version, current):
+        """fx0.msb 가 실제로 들어 있는 폴더를 찾는다.
+
+        CADOE_LIBDIR<버전> 이 Language 폴더까지만 가리키고 언어 폴더(en-us)가
+        빠져 있는 경우가 있어, 우선 그 아래를 먼저 본다.
+        """
+        bases = []
+        if current and os.path.isdir(current):
+            bases.append(current)
+        bases += cls._language_dirs(version)
+        for base in bases:
+            if os.path.isfile(os.path.join(base, CADOE_PROBE_FILE)):
+                return base
+            for sub in cls._lang_subdirs(base):
+                cand = os.path.join(base, sub)
+                if os.path.isfile(os.path.join(cand, CADOE_PROBE_FILE)):
+                    return cand
+        return None
+
+    @classmethod
+    def _find_ansys_lang(cls, version):
+        """설치된 ANSYS 의 Language 폴더에서 쓸 언어 코드를 찾는다."""
+        for lang_dir in cls._language_dirs(version):
+            subs = cls._lang_subdirs(lang_dir)
             if subs:
                 return subs[0]
         return None
@@ -1121,11 +1161,31 @@ class ConverterApp:
         파이썬 프로세스의 환경을 그대로 물려줄 뿐이라 비어 있을 수 있다.
         자식 프로세스가 물려받도록 os.environ 에 넣는다.
         """
-        if os.environ.get("ANSYS_LANG", "").strip():
+        if not os.environ.get("ANSYS_LANG", "").strip():
+            lang = self._find_ansys_lang(opts["version"]) or ANSYS_DEFAULT_LANG
+            os.environ["ANSYS_LANG"] = lang
+            log(f"  ANSYS_LANG was not set — using '{lang}' for this session.")
+        self._ensure_cadoe_libdir(opts, log)
+
+    def _ensure_cadoe_libdir(self, opts, log):
+        """CADOE_LIBDIR<버전> 이 fx0.msb 가 있는 폴더를 가리키게 맞춘다.
+
+        MAPDL 은 리소스를 CADOE_LIBDIR<버전> + "/fx0.msb" 로 찾는다. 이 값이
+        언어 폴더(en-us)까지 안 가고 Language 폴더에서 끊기면
+        "...\Language\/fx0.msb not found" 가 뜬다.
+        """
+        var = f"CADOE_LIBDIR{opts['version']}"
+        current = os.environ.get(var, "").strip().rstrip("\\/")
+        if current and os.path.isfile(os.path.join(current, CADOE_PROBE_FILE)):
             return
-        lang = self._find_ansys_lang(opts["version"]) or ANSYS_DEFAULT_LANG
-        os.environ["ANSYS_LANG"] = lang
-        log(f"  ANSYS_LANG was not set — using '{lang}' for this session.")
+        target = self._find_cadoe_libdir(opts["version"], current)
+        if not target:
+            if current:
+                log(f"  ({var}={current} has no {CADOE_PROBE_FILE}, and no "
+                    f"replacement was found — leaving it as is)")
+            return
+        os.environ[var] = target
+        log(f"  {var} -> {target}  (was {current or 'unset'})")
 
     @staticmethod
     def _port_is_free(port):
@@ -1178,6 +1238,43 @@ class ConverterApp:
                     pass
 
     @staticmethod
+    def _grpc_listen_port(out_dir):
+        """MAPDL 이 .out 에 남긴 실제 gRPC 리슨 포트를 읽는다."""
+        found = None
+        try:
+            names = sorted(os.listdir(out_dir))
+        except OSError:
+            return None
+        for name in names:
+            if not name.lower().endswith(".out"):
+                continue
+            try:
+                with open(os.path.join(out_dir, name), "r", errors="replace") as f:
+                    for m in GRPC_LISTEN_RE.finditer(f.read()):
+                        found = int(m.group(1))
+            except OSError:
+                continue
+        return found
+
+    def _report_port_mismatch(self, out_dir, wanted_port, log):
+        """MAPDL 이 다른 포트에 붙었으면 그게 접속 실패의 원인이다."""
+        actual = self._grpc_listen_port(out_dir)
+        if actual is None:
+            return
+        if wanted_port and actual != wanted_port:
+            log(
+                f"  >>> MAPDL is listening on port {actual}, but we connected to "
+                f"{wanted_port}. Port {wanted_port} was taken by something else, so "
+                f"MAPDL moved. Kill the leftover MAPDL holding {wanted_port} "
+                f"(netstat -ano | findstr {wanted_port}) and run again."
+            )
+        else:
+            log(
+                f"  (MAPDL did start its gRPC server on port {actual} — the "
+                f"connection itself was blocked. Check firewall/security software.)"
+            )
+
+    @staticmethod
     def _log_mapdl_startup_files(out_dir, log, max_lines=20):
         """기동 실패 원인은 PyMAPDL 메시지가 아니라 MAPDL 이 남긴 파일에 있다."""
         for name in sorted(os.listdir(out_dir)):
@@ -1210,17 +1307,16 @@ class ConverterApp:
     def _launch_attempts(self, out_dir, opts, log):
         """시도할 launch_mapdl 인자를 순서대로 만든다.
 
-        1차는 예전에 잘 돌던 인자 그대로 — 포트도 대기시간도 PyMAPDL 기본값에
-        맡긴다. 병렬 실행일 때만 포트가 겹치지 않게 명시하고, 1차가 실패했을
-        때의 2차 시도에서만 포트/대기시간을 직접 지정한다.
+        포트는 미리 비어 있는지 확인한 값을 항상 명시한다. 기본 포트(50052)가
+        이미 쓰이고 있으면 MAPDL 은 스스로 옆 포트로 옮겨 가는데, PyMAPDL 은
+        원래 포트에서 기다리다 접속에 실패한다. 빈 포트를 못 찾았을 때만
+        인자를 빼고 PyMAPDL 기본 동작에 맡긴다.
         """
         attempts = []
         first = self._base_launch_kwargs(out_dir, opts)
-        if opts["max_jobs"] > 1:
-            # 여러 인스턴스를 동시에 띄울 때만 포트를 직접 나눠 준다.
-            port = self._pick_free_port(log)
-            if port:
-                first["port"] = port
+        port = self._pick_free_port(log)
+        if port:
+            first["port"] = port
         attempts.append(first)
 
         retry = self._base_launch_kwargs(out_dir, opts)
@@ -1271,6 +1367,7 @@ class ConverterApp:
                 except Exception as e:
                     last_err = e
                     log(f"  MAPDL launch failed: {type(e).__name__}: {e}")
+                    self._report_port_mismatch(out_dir, kwargs.get("port"), log)
                     self._log_mapdl_startup_files(out_dir, log)
                     # 반쯤 뜬 인스턴스가 남아 포트를 물지 않도록 정리한다.
                     self._kill_leftover_processes(log)
