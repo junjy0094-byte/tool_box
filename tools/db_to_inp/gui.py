@@ -12,7 +12,9 @@ import queue
 import os
 import re
 import shutil
+import signal
 import socket
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -108,9 +110,11 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
 
 14. Stop 버튼
    - 아직 시작하지 않은 파일은 즉시 Cancelled 로 넘어갑니다.
-   - 이미 MAPDL 로 들어간 파일은 진행 중인 MAPDL 명령이 끝나는 시점
-     (노드 병합 / tie 처리 / 재질 정리 등 단계 경계)에 멈춥니다. 명령 하나가
-     오래 걸리면 그만큼 늦게 반응합니다.
+   - 이미 떠 있는 MAPDL 인스턴스는 바로 종료시킵니다. 정상 종료가 안 되면
+     우리가 띄운 PID 를 강제 종료(Windows: taskkill /F /T /PID)합니다.
+     따로 작업 관리자에서 죽일 필요가 없습니다.
+   - 진행 중이던 MAPDL 명령은 그 과정에서 끊기며, 해당 파일은 실패가 아니라
+     Cancelled 로 기록됩니다.
    - 중단된 파일의 .inp 는 만들어지지 않습니다.
 
 15. INP 출력 폴더와 파일명
@@ -124,18 +128,17 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
    - 단일 파일 모드는 기존과 같이 .db 옆에 <모델명>.inp 로 만듭니다.
 
 16. MAPDL 기동 실패 ("An error occurred when connecting to MAPDL")
-   - 인스턴스마다 비어 있는 포트를 찾아 따로 붙입니다(기본 50052부터 탐색).
-     이전 실행에서 죽지 않고 남은 MAPDL 이 기본 포트를 물고 있어도 넘어갑니다.
-   - 기동에 실패하면 포트를 바꿔 한 번 더 시도하고, 그래도 안 되면 MAPDL 이
-     작업 폴더에 남긴 .err/.out 내용을 Log 에 같이 찍어 줍니다.
-   - 앱을 닫을 때 아직 떠 있는 MAPDL 인스턴스를 정리합니다.
-   - 그래도 실패하면 보통 다음 중 하나입니다.
-     · 작업 관리자에 ANSYS/MAPDL 프로세스가 남아 있음 -> 모두 종료 후 재시도
-     · 라이선스 부족 -> Parallel jobs 를 줄이거나 License Type 확인
-     · Version 값이 실제 설치된 ANSYS 버전과 다름
-     · Parallel jobs x Processors 가 장비 코어 수를 넘음
-     · 경로에 한글/공백이 섞임 (일괄 모드 작업 폴더 이름은 자동으로 ASCII 로
-       정리하지만, 상위 경로는 사용자가 고른 그대로입니다)
+   - 1차 시도는 Parallel jobs=1 일 때 예전과 완전히 같은 인자로 띄웁니다
+     (포트/대기시간을 지정하지 않고 PyMAPDL 기본값에 맡김). 병렬일 때만
+     인스턴스끼리 겹치지 않게 포트를 나눠 줍니다.
+   - 1차가 실패하면 포트와 대기시간(120초)을 직접 지정해 한 번 더 시도합니다.
+   - 실제로 넘긴 인자를 Log 에 그대로 찍고, 실패하면 MAPDL 이 작업 폴더에 남긴
+     .err/.out 내용도 같이 찍습니다. 원인은 대부분 거기에 있습니다.
+   - 기동에 실패했거나 Stop 을 눌렀거나 앱을 닫을 때, 우리가 띄운 MAPDL 은
+     PID 로 강제 종료(Windows: taskkill /F /T)까지 해서 남기지 않습니다.
+   - MAPDL 이 "resource file ... not found" 같은 오류를 내며 뜨다 마는 경우는
+     ANSYS 설치/환경 문제입니다. Version 값과 AWP_ROOT<버전> 환경변수를 보고,
+     같은 버전을 ANSYS Launcher 로 직접 띄워 되는지부터 확인하세요.
 """
 
 
@@ -146,14 +149,19 @@ MAPDL_PORT_SCAN = 400
 MAPDL_START_TIMEOUT = 120
 
 MAPDL_LAUNCH_HINT = """\
-MAPDL 접속에 실패했습니다. 아래를 확인하세요.
-  1) 이전 실행에서 남은 ANSYS/MAPDL 프로세스가 있는지 (작업 관리자에서
-     ANSYS*.exe / MAPDL 프로세스를 모두 종료한 뒤 다시 실행).
-  2) 라이선스: License Type 이 맞는지, 그리고 동시에 띄우는 수
-     (Parallel jobs)만큼 라이선스가 남아 있는지.
-  3) MAPDL Launch Settings 의 Version 이 실제 설치된 ANSYS 버전과 같은지.
-  4) Parallel jobs x Processors 가 장비 코어 수를 넘지 않는지.
-  5) 경로에 한글/공백이 섞여 있지 않은지."""
+MAPDL 접속에 실패했습니다. 위에 찍힌 .out/.err 내용이 진짜 원인입니다.
+  · "resource file ... not found" 처럼 MAPDL 자체가 기동 중에 낸 오류라면
+    파이썬이 아니라 ANSYS 설치/환경 문제입니다. Version 값이 실제 설치된
+    버전과 같은지 확인하고, 같은 버전을 직접(ANSYS Mechanical APDL Launcher)
+    띄워 정상 실행되는지부터 보세요. 환경변수 AWP_ROOT<버전> 이 맞아야 합니다.
+  · 프로세스는 뜨는데 접속만 안 되면 방화벽/보안 프로그램이 로컬 gRPC 포트를
+    막고 있을 수 있습니다.
+  그 밖에 확인할 것:
+  1) 이전 실행에서 남은 ANSYS/MAPDL 프로세스 (작업 관리자에서 모두 종료,
+     또는 명령 프롬프트에서  taskkill /F /IM ANSYS.exe /T ).
+  2) 라이선스: License Type 이 맞는지, Parallel jobs 만큼 여유가 있는지.
+  3) Parallel jobs x Processors 가 장비 코어 수를 넘지 않는지.
+  4) 경로에 한글/공백이 섞여 있지 않은지."""
 
 
 # Target Files 목록에 찍히는 상태값
@@ -241,6 +249,8 @@ class ConverterApp:
         self._next_port = MAPDL_BASE_PORT
         # 떠 있는 인스턴스 추적 — 앱이 닫힐 때 남기지 않고 정리하기 위한 것.
         self._active_mapdl = set()
+        # 우리가 띄운 MAPDL 프로세스 PID — Stop / 종료 시 확실히 죽이기 위한 것.
+        self._spawned_pids = set()
         atexit.register(self._exit_all_mapdl)
         # Stop 버튼 신호 + 실행 중 여부
         self._stop_event = threading.Event()
@@ -769,9 +779,10 @@ class ConverterApp:
         self._stop_event.set()
         self.btn_stop.config(state="disabled")
         self._log(
-            "\n*** Stop requested — queued files are cancelled; a file already inside "
-            "MAPDL stops as soon as its current command returns. ***"
+            "\n*** Stop requested — queued files are cancelled and running MAPDL "
+            "instances are being shut down. ***"
         )
+        threading.Thread(target=self._force_stop_mapdl, daemon=True).start()
 
     def _collect_jobs(self):
         """실행 모드에 맞춰 변환할 파일 목록(_Job)을 만든다."""
@@ -981,9 +992,75 @@ class ConverterApp:
             self._set_status(job.db_path, ST_CANCELLED)
             return (job, ST_CANCELLED, None)
         except Exception as e:
+            if self._stop_event.is_set():
+                # Stop 으로 MAPDL 을 내리면서 끊긴 호출이다 — 실패가 아니라 취소.
+                log(f"=== Cancelled by Stop ({type(e).__name__}) ===")
+                self._set_status(job.db_path, ST_CANCELLED)
+                return (job, ST_CANCELLED, None)
             log(f"[ERROR] {e}")
             self._set_status(job.db_path, ST_FAILED)
             return (job, ST_FAILED, e)
+
+    @staticmethod
+    def _mapdl_pid(mapdl):
+        """PyMAPDL 버전마다 프로세스를 들고 있는 속성 이름이 달라 차례로 찾는다."""
+        for attr in ("_mapdl_process", "process", "_process", "_subprocess"):
+            proc = getattr(mapdl, attr, None)
+            pid = getattr(proc, "pid", None)
+            if pid:
+                return pid
+        return None
+
+    @staticmethod
+    def _kill_pid(pid):
+        """자식까지 강제 종료. 우리가 띄운 PID 에만 쓴다."""
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    def _kill_leftover_processes(self, log=None):
+        """이미 exit 를 시도한 뒤에도 남아 있는, 우리가 띄운 프로세스를 정리한다."""
+        for pid in list(self._spawned_pids):
+            self._kill_pid(pid)
+            self._spawned_pids.discard(pid)
+            if log:
+                log(f"  Killed leftover MAPDL process (pid {pid}).")
+
+    def _shutdown_mapdl(self, mapdl, log=None):
+        """인스턴스 하나를 닫고, 그래도 살아 있으면 PID 로 강제 종료한다."""
+        pid = self._mapdl_pid(mapdl)
+        try:
+            mapdl.exit()
+        except Exception:
+            try:
+                mapdl.exit(force=True)
+            except Exception as e:
+                if log:
+                    log(f"MAPDL exit warning: {e}")
+        self._active_mapdl.discard(mapdl)
+        if pid:
+            self._kill_pid(pid)
+            self._spawned_pids.discard(pid)
+
+    def _force_stop_mapdl(self):
+        """Stop 을 눌렀을 때 실제로 MAPDL 프로세스를 내린다 (별도 스레드).
+
+        작업 스레드는 gRPC 호출 안에서 대기 중일 수 있어 단계 경계만 기다리면
+        한참 안 죽는다. 그래서 여기서 직접 내리고, 진행 중이던 호출은 오류로
+        끊기며 해당 파일은 Cancelled 로 처리된다.
+        """
+        for mapdl in list(self._active_mapdl):
+            self._shutdown_mapdl(mapdl)
+        self._kill_leftover_processes()
+        self._log("*** MAPDL instances shut down. ***")
 
     def _exit_all_mapdl(self):
         """앱 종료 시 아직 떠 있는 MAPDL 을 닫는다.
@@ -992,14 +1069,9 @@ class ConverterApp:
         남은 인스턴스가 포트를 물고 있으면 다음 실행이 기동조차 못 한다.
         """
         for mapdl in list(self._active_mapdl):
-            try:
-                mapdl.exit()
-            except Exception:
-                try:
-                    mapdl.exit(force=True)
-                except Exception:
-                    pass
+            self._shutdown_mapdl(mapdl)
         self._active_mapdl.clear()
+        self._kill_leftover_processes()
 
     @staticmethod
     def _port_is_free(port):
@@ -1067,48 +1139,81 @@ class ConverterApp:
                 log(f"    {ln}")
 
     @staticmethod
-    def _call_launch_mapdl(launch_mapdl, out_dir, opts, port):
-        kwargs = dict(
+    def _base_launch_kwargs(out_dir, opts):
+        """단일 파일 실행에서 예전부터 쓰던 인자 그대로. 여기에 손대지 말 것."""
+        return dict(
             run_location=out_dir,
             override=True,
             version=opts["version"],
             nproc=opts["nproc"],
             license_type=opts["license_type"],
             additional_switches="-smp",
-            port=port,
-            start_timeout=MAPDL_START_TIMEOUT,
         )
+
+    def _launch_attempts(self, out_dir, opts, log):
+        """시도할 launch_mapdl 인자를 순서대로 만든다.
+
+        1차는 예전에 잘 돌던 인자 그대로 — 포트도 대기시간도 PyMAPDL 기본값에
+        맡긴다. 병렬 실행일 때만 포트가 겹치지 않게 명시하고, 1차가 실패했을
+        때의 2차 시도에서만 포트/대기시간을 직접 지정한다.
+        """
+        attempts = []
+        first = self._base_launch_kwargs(out_dir, opts)
+        if opts["max_jobs"] > 1:
+            # 여러 인스턴스를 동시에 띄울 때만 포트를 직접 나눠 준다.
+            first["port"] = self._pick_free_port(log)
+        attempts.append(first)
+
+        retry = self._base_launch_kwargs(out_dir, opts)
+        retry["port"] = self._pick_free_port(log)
+        retry["start_timeout"] = MAPDL_START_TIMEOUT
+        attempts.append(retry)
+        return attempts
+
+    @staticmethod
+    def _call_launch_mapdl(launch_mapdl, kwargs):
         try:
             return launch_mapdl(**kwargs)
         except TypeError:
-            # 설치된 ansys-mapdl-core 가 모르는 인자가 있으면 기본 인자만으로 한 번 더.
-            for key in ("start_timeout", "port"):
-                kwargs.pop(key, None)
-            return launch_mapdl(**kwargs)
+            # 설치된 ansys-mapdl-core 가 모르는 인자가 있으면 그 인자를 빼고 한 번 더.
+            trimmed = {k: v for k, v in kwargs.items()
+                       if k not in ("start_timeout", "port")}
+            if trimmed == kwargs:
+                raise
+            return launch_mapdl(**trimmed)
 
     def _launch_mapdl(self, launch_mapdl, out_dir, opts, log):
-        """포트를 바꿔 가며 최대 2번 시도하고, 실패하면 원인을 로그에 남긴다."""
+        """최대 2번 시도하고, 실패하면 원인을 로그에 남긴다."""
         last_err = None
-        for attempt in (1, 2):
+        # 기동만 직렬화한다 — 두 인스턴스가 같은 포트를 잡는 것을 막는다.
+        with self._launch_lock:
+            attempts = self._launch_attempts(out_dir, opts, log)
+        for attempt, kwargs in enumerate(attempts, start=1):
             self._raise_if_stopped()
-            # 기동만 직렬화한다 — 두 인스턴스가 같은 포트를 잡는 것을 막는다.
             with self._launch_lock:
                 self._raise_if_stopped()
-                port = self._pick_free_port(log)
                 self._clear_stale_locks(out_dir, log)
-                log(f"Launching MAPDL on port {port} (attempt {attempt}/2) ...")
+                shown = ", ".join(f"{k}={v!r}" for k, v in sorted(kwargs.items())
+                                  if k != "run_location")
+                log(f"Launching MAPDL (attempt {attempt}/{len(attempts)}): {shown}")
                 try:
-                    mapdl = self._call_launch_mapdl(launch_mapdl, out_dir, opts, port)
+                    mapdl = self._call_launch_mapdl(launch_mapdl, kwargs)
                     self._active_mapdl.add(mapdl)
+                    pid = self._mapdl_pid(mapdl)
+                    if pid:
+                        self._spawned_pids.add(pid)
+                        log(f"  MAPDL process pid {pid}")
                     return mapdl
                 except _Aborted:
                     raise
                 except Exception as e:
                     last_err = e
-                    log(f"  MAPDL launch failed (port {port}): {type(e).__name__}: {e}")
+                    log(f"  MAPDL launch failed: {type(e).__name__}: {e}")
                     self._log_mapdl_startup_files(out_dir, log)
-            if attempt == 1:
-                log("  Retrying on another port in 3 s ...")
+                    # 반쯤 뜬 인스턴스가 남아 포트를 물지 않도록 정리한다.
+                    self._kill_leftover_processes(log)
+            if attempt < len(attempts):
+                log("  Retrying with an explicit port in 3 s ...")
                 time.sleep(3)
         raise RuntimeError(f"{type(last_err).__name__}: {last_err}\n{MAPDL_LAUNCH_HINT}")
 
@@ -1198,14 +1303,7 @@ class ConverterApp:
             self._export_step1_metadata(mapdl, job, opts, log)
 
         finally:
-            try:
-                mapdl.exit()
-            except Exception:
-                try:
-                    mapdl.exit(force=True)
-                except Exception as e:
-                    log(f"MAPDL exit warning: {e}")
-            self._active_mapdl.discard(mapdl)
+            self._shutdown_mapdl(mapdl, log)
             log("MAPDL closed.")
 
     def _export_step1_metadata(self, mapdl, job, opts, log):
