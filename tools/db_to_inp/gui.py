@@ -1141,7 +1141,9 @@ class ConverterApp:
         """MAPDL 인스턴스마다 다른 포트를 준다 (_launch_lock 안에서만 호출).
 
         예전에 죽지 않고 남은 MAPDL 이 기본 포트(50052)를 물고 있으면 기동이
-        통째로 막히므로, 쓰고 있는 포트는 건너뛴다.
+        통째로 막히므로, 쓰고 있는 포트는 건너뛴다. 빈 포트를 못 찾으면 None 을
+        돌려주고, 호출한 쪽은 포트를 넘기지 않아 PyMAPDL 기본 동작에 맡긴다
+        (포트 탐색이 실패했다고 실행 자체를 막지는 않는다).
         """
         skipped = []
         port = self._next_port
@@ -1158,10 +1160,11 @@ class ConverterApp:
             skipped.append(port)
             port += 1
         self._next_port = MAPDL_BASE_PORT
-        raise RuntimeError(
-            f"MAPDL 용 빈 포트를 찾지 못했습니다 "
-            f"({MAPDL_BASE_PORT}~{limit - 1} 모두 사용 중).\n" + MAPDL_LAUNCH_HINT
+        log(
+            f"  (no free port found in {MAPDL_BASE_PORT}-{limit - 1} — "
+            f"letting PyMAPDL choose)"
         )
+        return None
 
     @staticmethod
     def _clear_stale_locks(out_dir, log):
@@ -1215,11 +1218,15 @@ class ConverterApp:
         first = self._base_launch_kwargs(out_dir, opts)
         if opts["max_jobs"] > 1:
             # 여러 인스턴스를 동시에 띄울 때만 포트를 직접 나눠 준다.
-            first["port"] = self._pick_free_port(log)
+            port = self._pick_free_port(log)
+            if port:
+                first["port"] = port
         attempts.append(first)
 
         retry = self._base_launch_kwargs(out_dir, opts)
-        retry["port"] = self._pick_free_port(log)
+        port = self._pick_free_port(log)
+        if port:
+            retry["port"] = port
         retry["start_timeout"] = MAPDL_START_TIMEOUT
         attempts.append(retry)
         return attempts
