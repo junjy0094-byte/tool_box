@@ -136,9 +136,17 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
      .err/.out 내용도 같이 찍습니다. 원인은 대부분 거기에 있습니다.
    - 기동에 실패했거나 Stop 을 눌렀거나 앱을 닫을 때, 우리가 띄운 MAPDL 은
      PID 로 강제 종료(Windows: taskkill /F /T)까지 해서 남기지 않습니다.
-   - MAPDL 이 "resource file ... not found" 같은 오류를 내며 뜨다 마는 경우는
-     ANSYS 설치/환경 문제입니다. Version 값과 AWP_ROOT<버전> 환경변수를 보고,
-     같은 버전을 ANSYS Launcher 로 직접 띄워 되는지부터 확인하세요.
+   - MAPDL 이 "resource file ...\Language\/fx0.msb not found" 로 뜨다 마는
+     경우는 ANSYS_LANG 환경변수가 비어 있어서입니다. MAPDL 이 리소스 경로를
+     "...\Language\<ANSYS_LANG>/fx0.msb" 로 조립하는데 가운데가 비면 파일을
+     찾지 못합니다. ANSYS Launcher 로 띄울 때는 런처가 이 값을 넣어 주지만,
+     여기서는 파이썬 프로세스의 환경을 그대로 물려주기 때문에 비어 있을 수
+     있습니다. 그래서 실행 직전에 비어 있으면 설치된 Language 폴더를 보고
+     (없으면 en-us 로) 자동으로 채웁니다.
+     계속 문제가 되면 사용자 환경변수에 ANSYS_LANG=en-us 를 직접 넣어 두세요.
+   - 그 밖에 MAPDL 자체가 내는 오류는 ANSYS 설치/환경 문제입니다. Version 값과
+     AWP_ROOT<버전> 환경변수를 보고, 같은 버전을 ANSYS Launcher 로 직접 띄워
+     되는지부터 확인하세요.
 """
 
 
@@ -147,13 +155,18 @@ MAPDL_BASE_PORT = 50052
 MAPDL_PORT_SCAN = 400
 # gRPC 접속 대기 시간(초). PyMAPDL 기본값(45초)은 큰 모델/느린 라이선스 서버에서 짧다.
 MAPDL_START_TIMEOUT = 120
+# ANSYS_LANG 이 비어 있을 때 쓸 기본 언어 코드 (Language 폴더 하위 폴더 이름).
+ANSYS_DEFAULT_LANG = "en-us"
 
 MAPDL_LAUNCH_HINT = """\
 MAPDL 접속에 실패했습니다. 위에 찍힌 .out/.err 내용이 진짜 원인입니다.
-  · "resource file ... not found" 처럼 MAPDL 자체가 기동 중에 낸 오류라면
-    파이썬이 아니라 ANSYS 설치/환경 문제입니다. Version 값이 실제 설치된
-    버전과 같은지 확인하고, 같은 버전을 직접(ANSYS Mechanical APDL Launcher)
-    띄워 정상 실행되는지부터 보세요. 환경변수 AWP_ROOT<버전> 이 맞아야 합니다.
+  · "resource file ...\Language\/fx0.msb not found" 는 ANSYS_LANG 이 비어
+    있다는 뜻입니다(경로 가운데 언어 코드가 빠짐). 실행 직전에 자동으로 채우지만,
+    그래도 나면 사용자 환경변수에 ANSYS_LANG=en-us 를 직접 넣고 다시 띄우세요.
+  · 그 밖에 MAPDL 자체가 기동 중에 낸 오류라면 파이썬이 아니라 ANSYS 설치/환경
+    문제입니다. Version 값이 실제 설치된 버전과 같은지 확인하고, 같은 버전을
+    직접(ANSYS Mechanical APDL Launcher) 띄워 정상 실행되는지부터 보세요.
+    환경변수 AWP_ROOT<버전> 이 맞아야 합니다.
   · 프로세스는 뜨는데 접속만 안 되면 방화벽/보안 프로그램이 로컬 gRPC 포트를
     막고 있을 수 있습니다.
   그 밖에 확인할 것:
@@ -1074,6 +1087,47 @@ class ConverterApp:
         self._kill_leftover_processes()
 
     @staticmethod
+    def _find_ansys_lang(version):
+        """설치된 ANSYS 의 Language 폴더에서 쓸 언어 코드를 찾는다."""
+        root = os.environ.get(f"AWP_ROOT{version}") or os.environ.get("AWP_ROOT")
+        if not root or not os.path.isdir(root):
+            return None
+        candidates = [
+            os.path.join(root, "ansys", "gui", "Language"),
+            os.path.join(root, "ansys", "Language"),
+            os.path.join(root, "commonfiles", "Language"),
+        ]
+        for lang_dir in candidates:
+            if not os.path.isdir(lang_dir):
+                continue
+            try:
+                subs = sorted(d for d in os.listdir(lang_dir)
+                              if os.path.isdir(os.path.join(lang_dir, d)))
+            except OSError:
+                continue
+            if ANSYS_DEFAULT_LANG in subs:
+                return ANSYS_DEFAULT_LANG
+            if subs:
+                return subs[0]
+        return None
+
+    def _ensure_ansys_lang(self, opts, log):
+        """ANSYS_LANG 이 비어 있으면 채워 준다 (_launch_lock 안에서 호출).
+
+        MAPDL 은 리소스 경로를 "...\Language\<ANSYS_LANG>/fx0.msb" 로 조립한다.
+        ANSYS_LANG 이 없으면 가운데가 비어 "...\Language\/fx0.msb" 를 찾다가
+        'resource file ... not found' 로 기동에 실패한다. ANSYS Launcher 로 띄울
+        때는 런처가 이 값을 넣어 주지만, PyMAPDL 이 실행 파일을 직접 띄우면
+        파이썬 프로세스의 환경을 그대로 물려줄 뿐이라 비어 있을 수 있다.
+        자식 프로세스가 물려받도록 os.environ 에 넣는다.
+        """
+        if os.environ.get("ANSYS_LANG", "").strip():
+            return
+        lang = self._find_ansys_lang(opts["version"]) or ANSYS_DEFAULT_LANG
+        os.environ["ANSYS_LANG"] = lang
+        log(f"  ANSYS_LANG was not set — using '{lang}' for this session.")
+
+    @staticmethod
     def _port_is_free(port):
         """아무도 듣고 있지 않으면 비어 있는 포트로 본다."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
@@ -1187,6 +1241,7 @@ class ConverterApp:
         last_err = None
         # 기동만 직렬화한다 — 두 인스턴스가 같은 포트를 잡는 것을 막는다.
         with self._launch_lock:
+            self._ensure_ansys_lang(opts, log)
             attempts = self._launch_attempts(out_dir, opts, log)
         for attempt, kwargs in enumerate(attempts, start=1):
             self._raise_if_stopped()
