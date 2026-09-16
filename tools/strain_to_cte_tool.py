@@ -23,6 +23,39 @@ mptemp,3, 25$mpdata,thsx,cu,3, 0.001
 mptemp,4, 60$mpdata,thsx,cu,4, 0.002
 mptemp,5, 80$mpdata,thsx,cu,5, 0.003"""
 
+_HELP = """\
+[ 무엇을 하는 도구인가 ]
+  ANSYS APDL 의 열변형(THSX) 물성 코드를 붙여넣으면 온도별 CTE(열팽창계수)를
+  계산한다. 물성표가 '온도-변형률' 로만 주어졌을 때 CTE 로 바꿔 쓰기 위한 도구다.
+  계산은 수치미분 CTE = dε/dT (첫 점 전진차분, 마지막 점 후진차분, 중간 중심차분).
+
+[ 입력 ]
+  · MPTEMP / MPDATA(THSX) 블록 텍스트를 입력창에 붙여넣기
+      mptemp,1,-65$mpdata,thsx,cu,1,-0.001
+      mptemp,2,-40$mpdata,thsx,cu,2, 0.000
+    한 줄에 $ 로 이어 쓴 형태, 여러 줄로 나뉜 형태 모두 인식한다.
+    ([예시 넣기] 버튼으로 형식을 확인할 수 있다)
+  · 옵션: CTE 단위, 숫자 형식, APDL 출력용 재료명 / 물성 라벨
+
+[ 출력 ]
+  · [표] 탭   : 온도 / strain / CTE 표
+  · [그래프] 탭: 온도-CTE 곡선 (strain 을 오른쪽 축에 함께 표시 가능)
+  · [APDL 코드] 탭: 그대로 붙여 쓸 수 있는 MPTEMP/MPDATA 코드
+  · [표 복사] / [APDL 코드 복사] 로 클립보드에 복사한다. 파일 저장은 없다.
+
+[ 사용 순서 ]
+  1. 물성 코드를 붙여넣는다 ([클립보드에서 붙여넣기] 사용 가능).
+  2. [변환] 을 누른다.
+  3. 표/그래프로 값을 확인하고, 필요한 쪽을 복사해 쓴다.
+
+[ 참고 ]
+  · MPDATA 의 흔한 오타(mpada, mpdat, mpdate)도 함께 인식한다.
+  · 표에 보이는 CTE 는 선택한 단위(예: ppm/K)로 환산된 값이지만,
+    [APDL 코드] 는 단위 설정과 무관하게 항상 1/K 절대값으로 출력한다.
+  · 온도 점이 2개 미만이면 미분할 수 없어 변환되지 않는다.
+"""
+
+
 # MPDATA 는 오타(mpada)로 적히는 경우가 잦아 함께 허용한다.
 _MPTEMP_KEYS = {"mptemp"}
 _MPDATA_KEYS = {"mpdata", "mpdat", "mpada", "mpdate"}
@@ -172,6 +205,8 @@ class StrainToCteTool(BaseTool):
     """Strain mp 코드를 붙여넣어 온도별 CTE 로 변환하는 도구."""
 
     name = "Strain → CTE 변환"
+    summary = "APDL 열변형(THSX) 물성을 온도별 CTE 로 변환 (표·그래프·APDL 코드)"
+    help_text = _HELP
     default_geometry = "980x860"
     min_size = (820, 620)
 

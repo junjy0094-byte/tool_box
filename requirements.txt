@@ -1,8 +1,9 @@
 Pillow
 mss
 tkinterdnd2
-# Trace Mapping / Strain → CTE 도구 의존성 (해당 도구를 열 때만 필요)
+# Trace Mapping / Strain → CTE / Zone 분할기 의존성 (해당 도구를 열 때만 필요)
 numpy
+scipy
 matplotlib
 shapely
 pcb-tools
