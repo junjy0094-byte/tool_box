@@ -136,11 +136,15 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
      .err/.out 내용도 같이 찍습니다. 원인은 대부분 거기에 있습니다.
    - 기동에 실패했거나 Stop 을 눌렀거나 앱을 닫을 때, 우리가 띄운 MAPDL 은
      PID 로 강제 종료(Windows: taskkill /F /T)까지 해서 남기지 않습니다.
-   - 기동에 쓸 포트는 미리 비어 있는지 확인해서 항상 명시합니다. 기본
-     포트(50052)를 다른 MAPDL 이 물고 있으면 MAPDL 은 스스로 옆 포트로 옮겨
-     가는데 PyMAPDL 은 원래 포트에서 기다리다 접속에 실패하기 때문입니다.
-     실패 시에는 MAPDL 이 .out 에 남긴 실제 리슨 포트를 읽어 어긋났는지
-     알려 줍니다.
+   - 기동에 쓸 포트는 시도할 때마다 비어 있는지 확인해서 명시합니다.
+   - 그래도 MAPDL 이 다른 포트에 gRPC 서버를 여는 경우가 있습니다. PyMAPDL 은
+     원래 포트에서 기다리다 접속에 실패하지만 프로세스는 멀쩡히 살아 있으므로,
+     .out 에서 실제 리슨 포트를 읽어 그 포트로 다시 붙어 그대로 진행합니다
+     (로그의 "Attached to MAPDL on port ..." 줄).
+   - 포트를 정확히 읽기 위해 기동 전에 이전 실행의 .out/.err/.lock 을 지웁니다.
+   - 변환기와 무관하게 PyMAPDL + ANSYS 설치만 점검하려면
+     "python scripts/mapdl_smoke_test.py" 를 돌려 보세요. 거기서도 실패하면
+     원인은 변환기 코드가 아닙니다.
    - "resource file ...\Language\/fx0.msb not found" 는 CADOE_LIBDIR<버전> 이
      언어 폴더(en-us)까지 안 가고 Language 폴더에서 끊겼다는 뜻입니다. 실행
      직전에 fx0.msb 가 실제로 있는 폴더를 찾아 바로잡고, ANSYS_LANG 도 비어
@@ -1227,15 +1231,25 @@ class ConverterApp:
         return None
 
     @staticmethod
-    def _clear_stale_locks(out_dir, log):
-        """이전 실행이 비정상 종료되며 남긴 lock 파일을 지운다."""
+    def _clear_stale_run_files(out_dir, log):
+        """이전 실행이 남긴 lock/.out/.err 를 지운다.
+
+        .out/.err 를 지우는 이유는 실패 원인과 실제 리슨 포트를 이번 실행의
+        출력에서만 읽기 위해서다. 지난 실행 파일이 섞이면 엉뚱한 포트를 읽는다.
+        """
+        removed_locks = 0
         for name in os.listdir(out_dir):
-            if name.lower().endswith(".lock"):
-                try:
-                    os.remove(os.path.join(out_dir, name))
-                    log(f"  Removed stale lock file: {name}")
-                except OSError:
-                    pass
+            low = name.lower()
+            if not low.endswith((".lock", ".out", ".err")):
+                continue
+            try:
+                os.remove(os.path.join(out_dir, name))
+                if low.endswith(".lock"):
+                    removed_locks += 1
+            except OSError:
+                pass
+        if removed_locks:
+            log(f"  Removed {removed_locks} stale lock file(s).")
 
     @staticmethod
     def _grpc_listen_port(out_dir):
@@ -1255,6 +1269,59 @@ class ConverterApp:
             except OSError:
                 continue
         return found
+
+    def _wait_for_port(self, port, timeout=30.0):
+        """해당 포트가 접속을 받기 시작할 때까지 기다린다."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._port_is_free(port):
+                return True
+            time.sleep(0.5)
+        return not self._port_is_free(port)
+
+    @staticmethod
+    def _pid_on_port(port):
+        """해당 포트를 LISTENING 중인 프로세스의 PID (Windows 전용)."""
+        if os.name != "nt":
+            return None
+        try:
+            out = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).stdout
+        except Exception:
+            return None
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[3].upper() == "LISTENING" \
+                    and parts[1].endswith(f":{port}"):
+                try:
+                    return int(parts[4])
+                except ValueError:
+                    return None
+        return None
+
+    def _attach_to_running(self, launch_mapdl, port, log):
+        """이미 떠 있는 MAPDL 에 붙는다.
+
+        MAPDL 이 우리가 준 포트가 아닌 다른 포트에 붙는 경우가 있는데, 그러면
+        PyMAPDL 은 원래 포트에서 기다리다 실패한다. 프로세스는 멀쩡히 살아
+        있으므로 실제 포트로 새로 접속해 그대로 쓴다.
+        """
+        if not self._wait_for_port(port):
+            return None
+        log(f"  Attaching to the MAPDL already listening on port {port} ...")
+        try:
+            mapdl = launch_mapdl(start_instance=False, ip="127.0.0.1", port=port)
+        except Exception as e:
+            log(f"  Attach failed: {type(e).__name__}: {e}")
+            return None
+        log(f"  Attached to MAPDL on port {port}.")
+        pid = self._pid_on_port(port)
+        if pid:
+            self._spawned_pids.add(pid)
+            log(f"  MAPDL process pid {pid}")
+        return mapdl
 
     def _report_port_mismatch(self, out_dir, wanted_port, log):
         """MAPDL 이 다른 포트에 붙었으면 그게 접속 실패의 원인이다."""
@@ -1304,28 +1371,20 @@ class ConverterApp:
             additional_switches="-smp",
         )
 
-    def _launch_attempts(self, out_dir, opts, log):
-        """시도할 launch_mapdl 인자를 순서대로 만든다.
+    def _launch_kwargs_for(self, out_dir, opts, attempt, log):
+        """attempt 번째 시도에 쓸 launch_mapdl 인자.
 
-        포트는 미리 비어 있는지 확인한 값을 항상 명시한다. 기본 포트(50052)가
-        이미 쓰이고 있으면 MAPDL 은 스스로 옆 포트로 옮겨 가는데, PyMAPDL 은
-        원래 포트에서 기다리다 접속에 실패한다. 빈 포트를 못 찾았을 때만
+        포트는 시도할 때마다 새로 고른다 (앞선 시도가 남긴 인스턴스가 포트를
+        물고 있을 수 있으므로 미리 정해 두면 안 된다). 빈 포트를 못 찾으면
         인자를 빼고 PyMAPDL 기본 동작에 맡긴다.
         """
-        attempts = []
-        first = self._base_launch_kwargs(out_dir, opts)
+        kwargs = self._base_launch_kwargs(out_dir, opts)
         port = self._pick_free_port(log)
         if port:
-            first["port"] = port
-        attempts.append(first)
-
-        retry = self._base_launch_kwargs(out_dir, opts)
-        port = self._pick_free_port(log)
-        if port:
-            retry["port"] = port
-        retry["start_timeout"] = MAPDL_START_TIMEOUT
-        attempts.append(retry)
-        return attempts
+            kwargs["port"] = port
+        if attempt > 1:
+            kwargs["start_timeout"] = MAPDL_START_TIMEOUT
+        return kwargs
 
     @staticmethod
     def _call_launch_mapdl(launch_mapdl, kwargs):
@@ -1342,39 +1401,54 @@ class ConverterApp:
     def _launch_mapdl(self, launch_mapdl, out_dir, opts, log):
         """최대 2번 시도하고, 실패하면 원인을 로그에 남긴다."""
         last_err = None
-        # 기동만 직렬화한다 — 두 인스턴스가 같은 포트를 잡는 것을 막는다.
-        with self._launch_lock:
-            self._ensure_ansys_lang(opts, log)
-            attempts = self._launch_attempts(out_dir, opts, log)
-        for attempt, kwargs in enumerate(attempts, start=1):
+        total = 2
+        for attempt in range(1, total + 1):
             self._raise_if_stopped()
+            # 기동만 직렬화한다 — 두 인스턴스가 같은 포트를 잡는 것을 막는다.
             with self._launch_lock:
                 self._raise_if_stopped()
-                self._clear_stale_locks(out_dir, log)
+                self._ensure_ansys_lang(opts, log)
+                self._clear_stale_run_files(out_dir, log)
+                kwargs = self._launch_kwargs_for(out_dir, opts, attempt, log)
                 shown = ", ".join(f"{k}={v!r}" for k, v in sorted(kwargs.items())
                                   if k != "run_location")
-                log(f"Launching MAPDL (attempt {attempt}/{len(attempts)}): {shown}")
+                log(f"Launching MAPDL (attempt {attempt}/{total}): {shown}")
                 try:
                     mapdl = self._call_launch_mapdl(launch_mapdl, kwargs)
-                    self._active_mapdl.add(mapdl)
-                    pid = self._mapdl_pid(mapdl)
-                    if pid:
-                        self._spawned_pids.add(pid)
-                        log(f"  MAPDL process pid {pid}")
-                    return mapdl
+                    return self._track_instance(mapdl, log)
                 except _Aborted:
                     raise
                 except Exception as e:
                     last_err = e
                     log(f"  MAPDL launch failed: {type(e).__name__}: {e}")
                     self._report_port_mismatch(out_dir, kwargs.get("port"), log)
+                    # 프로세스는 떠 있는데 포트만 어긋난 경우가 있다. 그러면
+                    # 죽이지 말고 MAPDL 이 실제로 연 포트로 붙어서 그대로 쓴다.
+                    actual = self._grpc_listen_port(out_dir)
+                    if actual and actual != kwargs.get("port"):
+                        attached = self._attach_to_running(launch_mapdl, actual, log)
+                        if attached is not None:
+                            return self._track_instance(attached, log)
                     self._log_mapdl_startup_files(out_dir, log)
                     # 반쯤 뜬 인스턴스가 남아 포트를 물지 않도록 정리한다.
+                    if actual:
+                        pid = self._pid_on_port(actual)
+                        if pid:
+                            self._spawned_pids.add(pid)
                     self._kill_leftover_processes(log)
-            if attempt < len(attempts):
-                log("  Retrying with an explicit port in 3 s ...")
+            if attempt < total:
+                log("  Retrying in 3 s ...")
                 time.sleep(3)
         raise RuntimeError(f"{type(last_err).__name__}: {last_err}\n{MAPDL_LAUNCH_HINT}")
+
+    def _track_instance(self, mapdl, log):
+        """기동/접속에 성공한 인스턴스를 추적 목록에 넣는다."""
+        self._active_mapdl.add(mapdl)
+        pid = self._mapdl_pid(mapdl)
+        if pid:
+            self._spawned_pids.add(pid)
+            log(f"  MAPDL process pid {pid}")
+        return mapdl
 
     def _step1_cleanup(self, job, opts, log):
         """PyMAPDL: cleanup model and CDWRITE."""
