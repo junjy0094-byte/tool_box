@@ -6,10 +6,14 @@ parent 프레임 안에 임베드할 수 있도록 ``build_gui(parent)`` 를 추
 
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox, ttk
+import atexit
 import threading
 import queue
 import os
+import re
 import shutil
+import socket
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from . import mapdl_ops, cdb_utils, inp_writer, utils
@@ -118,7 +122,38 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
      하위 폴더까지 훑을 때 서로 다른 폴더의 같은 이름을 구분하기 위한 규칙이며,
      그래도 겹치면 _2, _3 이 붙습니다.
    - 단일 파일 모드는 기존과 같이 .db 옆에 <모델명>.inp 로 만듭니다.
+
+16. MAPDL 기동 실패 ("An error occurred when connecting to MAPDL")
+   - 인스턴스마다 비어 있는 포트를 찾아 따로 붙입니다(기본 50052부터 탐색).
+     이전 실행에서 죽지 않고 남은 MAPDL 이 기본 포트를 물고 있어도 넘어갑니다.
+   - 기동에 실패하면 포트를 바꿔 한 번 더 시도하고, 그래도 안 되면 MAPDL 이
+     작업 폴더에 남긴 .err/.out 내용을 Log 에 같이 찍어 줍니다.
+   - 앱을 닫을 때 아직 떠 있는 MAPDL 인스턴스를 정리합니다.
+   - 그래도 실패하면 보통 다음 중 하나입니다.
+     · 작업 관리자에 ANSYS/MAPDL 프로세스가 남아 있음 -> 모두 종료 후 재시도
+     · 라이선스 부족 -> Parallel jobs 를 줄이거나 License Type 확인
+     · Version 값이 실제 설치된 ANSYS 버전과 다름
+     · Parallel jobs x Processors 가 장비 코어 수를 넘음
+     · 경로에 한글/공백이 섞임 (일괄 모드 작업 폴더 이름은 자동으로 ASCII 로
+       정리하지만, 상위 경로는 사용자가 고른 그대로입니다)
 """
+
+
+# PyMAPDL 기본 포트. 여기서부터 비어 있는 포트를 찾아 인스턴스마다 따로 붙인다.
+MAPDL_BASE_PORT = 50052
+MAPDL_PORT_SCAN = 400
+# gRPC 접속 대기 시간(초). PyMAPDL 기본값(45초)은 큰 모델/느린 라이선스 서버에서 짧다.
+MAPDL_START_TIMEOUT = 120
+
+MAPDL_LAUNCH_HINT = """\
+MAPDL 접속에 실패했습니다. 아래를 확인하세요.
+  1) 이전 실행에서 남은 ANSYS/MAPDL 프로세스가 있는지 (작업 관리자에서
+     ANSYS*.exe / MAPDL 프로세스를 모두 종료한 뒤 다시 실행).
+  2) 라이선스: License Type 이 맞는지, 그리고 동시에 띄우는 수
+     (Parallel jobs)만큼 라이선스가 남아 있는지.
+  3) MAPDL Launch Settings 의 Version 이 실제 설치된 ANSYS 버전과 같은지.
+  4) Parallel jobs x Processors 가 장비 코어 수를 넘지 않는지.
+  5) 경로에 한글/공백이 섞여 있지 않은지."""
 
 
 # Target Files 목록에 찍히는 상태값
@@ -202,6 +237,11 @@ class ConverterApp:
         # 두 인스턴스가 동시에 포트를 잡으려다 충돌하지 않도록 MAPDL 기동만 직렬화한다.
         # (기동 후 무거운 작업은 그대로 병렬로 돈다.)
         self._launch_lock = threading.Lock()
+        # 인스턴스마다 다른 포트를 쓰도록 스캔 시작점을 들고 다닌다.
+        self._next_port = MAPDL_BASE_PORT
+        # 떠 있는 인스턴스 추적 — 앱이 닫힐 때 남기지 않고 정리하기 위한 것.
+        self._active_mapdl = set()
+        atexit.register(self._exit_all_mapdl)
         # Stop 버튼 신호 + 실행 중 여부
         self._stop_event = threading.Event()
         self._running = False
@@ -758,7 +798,8 @@ class ConverterApp:
                 jobs.append(_Job(
                     db_path=f,
                     # 파일끼리 중간 산출물이 섞이지 않도록 모델별 폴더를 쓴다.
-                    data_dir=os.path.join(os.path.dirname(f), "_data", stem),
+                    data_dir=os.path.join(os.path.dirname(f), "_data",
+                                          self._safe_dir_name(stem)),
                     is_submodel=self._auto_submodel(f),
                     inp_path=os.path.join(out_root, inp_name),
                     prefix=f"[{stem}] ",
@@ -782,6 +823,22 @@ class ConverterApp:
             inp_path=os.path.join(out_dir, os.path.splitext(os.path.basename(db_path))[0] + ".inp"),
             prefix="",
         )]
+
+    @staticmethod
+    def _safe_dir_name(stem):
+        """MAPDL 작업 폴더 이름으로 쓸 수 있게 ASCII 로 정리한다.
+
+        MAPDL 은 작업 경로에 한글/공백/특수문자가 있으면 기동에 실패할 수 있어
+        모델명을 그대로 폴더명으로 쓰지 않는다. 정리하다 이름이 겹칠 수 있으므로
+        바뀐 경우에는 원래 이름의 해시를 붙여 구분한다.
+        """
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", stem).strip("._-")[:40]
+        if not safe:
+            safe = "model"
+        if safe != stem:
+            import hashlib
+            safe = f"{safe}_{hashlib.md5(stem.encode('utf-8')).hexdigest()[:6]}"
+        return safe
 
     @staticmethod
     def _unique_inp_name(stem, src_folder, used_names):
@@ -928,6 +985,133 @@ class ConverterApp:
             self._set_status(job.db_path, ST_FAILED)
             return (job, ST_FAILED, e)
 
+    def _exit_all_mapdl(self):
+        """앱 종료 시 아직 떠 있는 MAPDL 을 닫는다.
+
+        작업 스레드는 daemon 이라 종료 시 finally 가 돌지 않을 수 있고, 그렇게
+        남은 인스턴스가 포트를 물고 있으면 다음 실행이 기동조차 못 한다.
+        """
+        for mapdl in list(self._active_mapdl):
+            try:
+                mapdl.exit()
+            except Exception:
+                try:
+                    mapdl.exit(force=True)
+                except Exception:
+                    pass
+        self._active_mapdl.clear()
+
+    @staticmethod
+    def _port_is_free(port):
+        """아무도 듣고 있지 않으면 비어 있는 포트로 본다."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+            sk.settimeout(0.3)
+            try:
+                return sk.connect_ex(("127.0.0.1", port)) != 0
+            except OSError:
+                return False
+
+    def _pick_free_port(self, log):
+        """MAPDL 인스턴스마다 다른 포트를 준다 (_launch_lock 안에서만 호출).
+
+        예전에 죽지 않고 남은 MAPDL 이 기본 포트(50052)를 물고 있으면 기동이
+        통째로 막히므로, 쓰고 있는 포트는 건너뛴다.
+        """
+        skipped = []
+        port = self._next_port
+        limit = MAPDL_BASE_PORT + MAPDL_PORT_SCAN
+        while port < limit:
+            if self._port_is_free(port):
+                if skipped:
+                    log(
+                        f"  (port {', '.join(str(p) for p in skipped)} in use — "
+                        f"another MAPDL instance may still be running)"
+                    )
+                self._next_port = port + 1
+                return port
+            skipped.append(port)
+            port += 1
+        self._next_port = MAPDL_BASE_PORT
+        raise RuntimeError(
+            f"MAPDL 용 빈 포트를 찾지 못했습니다 "
+            f"({MAPDL_BASE_PORT}~{limit - 1} 모두 사용 중).\n" + MAPDL_LAUNCH_HINT
+        )
+
+    @staticmethod
+    def _clear_stale_locks(out_dir, log):
+        """이전 실행이 비정상 종료되며 남긴 lock 파일을 지운다."""
+        for name in os.listdir(out_dir):
+            if name.lower().endswith(".lock"):
+                try:
+                    os.remove(os.path.join(out_dir, name))
+                    log(f"  Removed stale lock file: {name}")
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _log_mapdl_startup_files(out_dir, log, max_lines=20):
+        """기동 실패 원인은 PyMAPDL 메시지가 아니라 MAPDL 이 남긴 파일에 있다."""
+        for name in sorted(os.listdir(out_dir)):
+            if not name.lower().endswith((".err", ".out")):
+                continue
+            path = os.path.join(out_dir, name)
+            try:
+                with open(path, "r", errors="replace") as f:
+                    tail = [ln.rstrip() for ln in f.read().splitlines() if ln.strip()]
+            except OSError:
+                continue
+            if not tail:
+                continue
+            log(f"  --- {name} (last {min(len(tail), max_lines)} line(s)) ---")
+            for ln in tail[-max_lines:]:
+                log(f"    {ln}")
+
+    @staticmethod
+    def _call_launch_mapdl(launch_mapdl, out_dir, opts, port):
+        kwargs = dict(
+            run_location=out_dir,
+            override=True,
+            version=opts["version"],
+            nproc=opts["nproc"],
+            license_type=opts["license_type"],
+            additional_switches="-smp",
+            port=port,
+            start_timeout=MAPDL_START_TIMEOUT,
+        )
+        try:
+            return launch_mapdl(**kwargs)
+        except TypeError:
+            # 설치된 ansys-mapdl-core 가 모르는 인자가 있으면 기본 인자만으로 한 번 더.
+            for key in ("start_timeout", "port"):
+                kwargs.pop(key, None)
+            return launch_mapdl(**kwargs)
+
+    def _launch_mapdl(self, launch_mapdl, out_dir, opts, log):
+        """포트를 바꿔 가며 최대 2번 시도하고, 실패하면 원인을 로그에 남긴다."""
+        last_err = None
+        for attempt in (1, 2):
+            self._raise_if_stopped()
+            # 기동만 직렬화한다 — 두 인스턴스가 같은 포트를 잡는 것을 막는다.
+            with self._launch_lock:
+                self._raise_if_stopped()
+                port = self._pick_free_port(log)
+                self._clear_stale_locks(out_dir, log)
+                log(f"Launching MAPDL on port {port} (attempt {attempt}/2) ...")
+                try:
+                    mapdl = self._call_launch_mapdl(launch_mapdl, out_dir, opts, port)
+                    self._active_mapdl.add(mapdl)
+                    return mapdl
+                except _Aborted:
+                    raise
+                except Exception as e:
+                    last_err = e
+                    log(f"  MAPDL launch failed (port {port}): {type(e).__name__}: {e}")
+                    self._log_mapdl_startup_files(out_dir, log)
+            if attempt == 1:
+                log("  Retrying on another port in 3 s ...")
+                time.sleep(3)
+        raise RuntimeError(f"{type(last_err).__name__}: {last_err}\n{MAPDL_LAUNCH_HINT}")
+
     def _step1_cleanup(self, job, opts, log):
         """PyMAPDL: cleanup model and CDWRITE."""
         log("=== Step 1: PyMAPDL cleanup + CDWRITE ===")
@@ -938,27 +1122,20 @@ class ConverterApp:
         os.makedirs(out_dir, exist_ok=True)
         self._raise_if_stopped()
 
-        with self._launch_lock:
-            self._raise_if_stopped()
-            mapdl = launch_mapdl(
-                run_location=out_dir,
-                override=True,
-                version=opts["version"],
-                nproc=opts["nproc"],
-                license_type=opts["license_type"],
-                additional_switches="-smp",
-            )
-        log(f"MAPDL launched (v{mapdl.version})")
-
-        step1_log_path = os.path.join(out_dir, "step1_apdl.log")
-        self._step1_log_path = step1_log_path
+        mapdl = self._launch_mapdl(launch_mapdl, out_dir, opts, log)
+        # 여기서부터는 어떤 경로로 빠져나가든 인스턴스를 반드시 닫는다.
+        # (안 닫고 새면 다음 실행이 포트를 못 잡아 기동 자체가 막힌다.)
         try:
-            mapdl.open_apdl_log(step1_log_path, mode="w")
-            log(f"APDL command log: {step1_log_path}")
-        except Exception as e:
-            log(f"  (APDL log not started: {e})")
+            log(f"MAPDL launched (v{mapdl.version})")
 
-        try:
+            step1_log_path = os.path.join(out_dir, "step1_apdl.log")
+            self._step1_log_path = step1_log_path
+            try:
+                mapdl.open_apdl_log(step1_log_path, mode="w")
+                log(f"APDL command log: {step1_log_path}")
+            except Exception as e:
+                log(f"  (APDL log not started: {e})")
+
             db_src = job.db_path
             db_dst = os.path.join(out_dir, os.path.basename(db_src))
             if os.path.normpath(db_src) != os.path.normpath(db_dst):
@@ -1028,6 +1205,7 @@ class ConverterApp:
                     mapdl.exit(force=True)
                 except Exception as e:
                     log(f"MAPDL exit warning: {e}")
+            self._active_mapdl.discard(mapdl)
             log("MAPDL closed.")
 
     def _export_step1_metadata(self, mapdl, job, opts, log):
