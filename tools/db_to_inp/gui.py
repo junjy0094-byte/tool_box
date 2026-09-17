@@ -79,6 +79,12 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
      형태로 재질마다 한 줄씩 들어갑니다. 초기응력이 없거나 해당 재질의
      요소가 모델에 없으면 그 줄은 만들어지지 않습니다.
 
+7-1. clean_model.db 저장
+   - Settings 의 "Save cleaned model as clean_model.db" 는 기본이 꺼져 있습니다.
+   - 정리된 모델을 ANSYS 에서 다시 열어 볼 때만 필요한 보관용 파일입니다.
+     .inp 변환(Step 2)은 clean_model.cdb 만 읽으므로 꺼도 결과는 같습니다.
+   - 큰 모델일수록 저장에 시간이 걸리므로, 필요할 때만 켜세요.
+
 8. MAPDL 실행 옵션
    - 병렬 모드는 SMP(-smp)로 고정되어 있습니다. MPI 등 다른 옵션이 필요하면
      코드 수정이 필요합니다.
@@ -273,6 +279,9 @@ class ConverterApp:
         # NOTE: the built-in CDB parser (Step 2) requires BLOCKED nblock/eblock,
         # so a full Step 2 run forces BLOCKED regardless of this flag.
         self.cdwrite_unblocked = tk.BooleanVar(value=True)
+        # 정리된 모델을 clean_model.db 로 남길지. Step 2 는 .cdb 만 읽으므로
+        # 보관용이며, 큰 모델에서는 저장 시간이 길어 기본은 꺼 둔다.
+        self.save_clean_db = tk.BooleanVar(value=False)
         self.is_submodel = tk.BooleanVar(value=False)
         self.free_mesh = tk.BooleanVar(value=False)
         self.symmetry_options = [
@@ -416,6 +425,13 @@ class ConverterApp:
             text="CDWRITE UNBLOCKED (HyperMesh compatible; auto-disabled for full Step 2 run)",
             variable=self.cdwrite_unblocked,
         ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(5, 0))
+
+        tk.Checkbutton(
+            frm_set,
+            text="Save cleaned model as clean_model.db (보관용 — .inp 변환에는 쓰지 않음, "
+                 "큰 모델에서는 느려짐)",
+            variable=self.save_clean_db,
+        ).grid(row=2, column=0, columnspan=6, sticky="w")
 
         frm_model = tk.LabelFrame(self.root, text="Model Configuration", padx=10, pady=5)
         frm_model.pack(fill="x", padx=10, pady=5)
@@ -959,6 +975,7 @@ class ConverterApp:
             "init_temp": init_temp,
             "final_temp": final_temp,
             "cdwrite_unblocked": bool(self.cdwrite_unblocked.get()),
+            "save_clean_db": bool(self.save_clean_db.get()),
             "symmetry_mode": self._symmetry_key(),
             "has_orthotropic": bool(self.has_orthotropic.get()),
             "ortho_mat_range": self._parse_ortho_mat_range(),
@@ -1614,10 +1631,13 @@ class ConverterApp:
 
             mapdl.allsel("ALL")
 
-            db_name = "clean_model"
-            log(f"Saving cleaned model as {db_name}.db ...")
-            mapdl.save(db_name, "db")
-            log(f"{db_name}.db saved.")
+            if opts["save_clean_db"]:
+                db_name = "clean_model"
+                log(f"Saving cleaned model as {db_name}.db ...")
+                mapdl.save(db_name, "db")
+                log(f"{db_name}.db saved.")
+            else:
+                log("Skipping clean_model.db save (option off).")
 
             cdb_name = "clean_model"
             is_full_run = not opts["stop_after_step1"]
