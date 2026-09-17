@@ -787,3 +787,129 @@ def dump_mapdl_mplist(mapdl, mplist_path):
     except Exception:
         with open(mplist_path, "w") as f:
             f.write("")
+
+
+# ---------------------------------------------------------------------------
+# Initial state (initial stress)
+# ---------------------------------------------------------------------------
+
+# INISTATE,LIST 는 재질 번호를 열로 찍기도 하고 "MAT = 991" 처럼 찍기도 한다.
+_INISTATE_MAT_RE = re.compile(r"\bMAT(?:ERIAL)?\s*(?:ID)?\s*[=:]\s*(\d+)", re.IGNORECASE)
+_INISTATE_NUM_RE = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[EeDd][-+]?\d+)?")
+# 한 행의 열 순서: elem, intpt, layer, section, material, csys, v1..v6
+_INISTATE_MAT_COL = 4
+_INISTATE_VAL_COL = 6
+_INISTATE_NCOMP = 6
+
+
+def _inistate_float(tok):
+    try:
+        return float(tok.replace("D", "E").replace("d", "e"))
+    except ValueError:
+        return None
+
+
+def parse_inistate_list(text, mat_ids):
+    """Parse INISTATE,LIST output into ``{mat_id: [s1..s6]}``.
+
+    Data rows follow the INISTATE column order
+    ``elem, intpt, layer, section, material, csys, v1..v6``: the CSYS column is
+    skipped and the six stress components after it are kept. Materials outside
+    ``mat_ids`` and rows whose components are all zero are ignored; the first
+    non-zero row wins for each material.
+    """
+    wanted = {int(m) for m in mat_ids}
+    result = {}
+    if not wanted:
+        return result
+
+    def _store(mat, vals):
+        if mat not in wanted or mat in result:
+            return
+        if any(v is None for v in vals):
+            return
+        if all(v == 0.0 for v in vals):
+            return
+        result[mat] = list(vals)
+
+    pending_mat = None
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        vals = [_inistate_float(t) for t in _INISTATE_NUM_RE.findall(line)]
+        if len(vals) >= _INISTATE_VAL_COL + _INISTATE_NCOMP and vals[_INISTATE_MAT_COL] is not None:
+            _store(
+                int(vals[_INISTATE_MAT_COL]),
+                vals[_INISTATE_VAL_COL:_INISTATE_VAL_COL + _INISTATE_NCOMP],
+            )
+            pending_mat = None
+            continue
+        m = _INISTATE_MAT_RE.search(line)
+        if m:
+            pending_mat = int(m.group(1))
+            continue
+        if pending_mat is not None and len(vals) == _INISTATE_NCOMP:
+            _store(pending_mat, vals)
+            pending_mat = None
+    return result
+
+
+def get_initial_stress(mapdl, log_fn, mat_ids):
+    """Return ``{mat_id: [s1..s6]}`` initial stress read from the model.
+
+    The lowest-numbered element is selected on its own and INISTATE,LIST is
+    parsed from its output; only the requested material IDs carrying non-zero
+    stress are returned. An empty dict means the model has no initial stress.
+    """
+    wanted = sorted({int(m) for m in mat_ids or ()})
+    if not wanted:
+        return {}
+
+    try:
+        mapdl.allsel("ALL")
+        min_eid = int(mapdl.get("MINEL", "ELEM", "", "NUM", "MIN"))
+    except Exception as e:
+        log_fn(f"  Warning: could not query the lowest element number: {e}")
+        return {}
+    if min_eid <= 0:
+        log_fn("  No elements found, skipping initial stress.")
+        return {}
+
+    macro_path = os.path.join(mapdl.directory, "_dump_inistate.mac")
+    try:
+        with open(macro_path, "w") as f:
+            f.write("ALLSEL,ALL\n")
+            f.write(f"ESEL,S,ELEM,,{min_eid}\n")
+            f.write("/OUTPUT,_inistate,txt\n")
+            f.write("INISTATE,LIST\n")
+            f.write("/OUTPUT\n")
+            f.write("ALLSEL,ALL\n")
+        mapdl.input(macro_path)
+    except Exception as e:
+        log_fn(f"  Warning: INISTATE,LIST failed: {e}")
+        return {}
+    finally:
+        try:
+            mapdl.allsel("ALL")
+        except Exception:
+            pass
+
+    try:
+        with open(os.path.join(mapdl.directory, "_inistate.txt"), "r") as f:
+            text = f.read()
+    except OSError:
+        log_fn("  INISTATE,LIST produced no output; no initial stress.")
+        return {}
+
+    stresses = parse_inistate_list(text, wanted)
+    if not stresses:
+        log_fn(
+            f"  No initial stress on element {min_eid} for material(s) "
+            f"{', '.join(str(m) for m in wanted)}."
+        )
+        return {}
+    for mid in sorted(stresses):
+        vals = ", ".join(f"{v:.6g}" for v in stresses[mid])
+        log_fn(f"  Initial stress mat {mid}: {vals}")
+    return stresses

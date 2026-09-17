@@ -266,7 +266,8 @@ def _is_orthotropic_mat(mid, has_orthotropic, ortho_mat_range):
 def write_template_inp(inp_path, nodes, elems_by_mat, mat_ids, nsets, mat_info, log_fn=None,
                        is_submodel=False, symmetry_mode="quarter",
                        init_temp=183.0, final_temp=25.0,
-                       has_orthotropic=True, ortho_mat_range=(9990, 9999)):
+                       has_orthotropic=True, ortho_mat_range=(9990, 9999),
+                       init_stress=None):
     """Write the Abaqus INP template file.
 
     ``symmetry_mode`` ("quarter" or "full") selects the NSET/BOUNDARY scheme
@@ -277,6 +278,9 @@ def write_template_inp(inp_path, nodes, elems_by_mat, mat_ids, nsets, mat_info, 
     ``has_orthotropic``/``ortho_mat_range`` select which material IDs (if
     any) are treated as orthotropic effective materials; all others are
     written as isotropic.
+
+    ``init_stress`` ({mat_id: [s1..s6]}, submodel only) adds an
+    ``*INITIAL CONDITIONS, TYPE=STRESS`` block for the matching element sets.
     """
     with open(inp_path, "w") as f:
         f.write("*NODE\n")
@@ -325,7 +329,7 @@ def write_template_inp(inp_path, nodes, elems_by_mat, mat_ids, nsets, mat_info, 
                 _write_material_isotropic(f, props)
 
         if is_submodel:
-            _write_step_submodel(f, init_temp, final_temp)
+            _write_step_submodel(f, init_temp, final_temp, mat_ids, init_stress)
         else:
             if symmetry_mode == "full":
                 _write_step_full(f, init_temp, final_temp)
@@ -451,10 +455,26 @@ def _write_step_full(f, init_temp, final_temp):
     f.write("*END STEP\n")
 
 
-def _write_step_submodel(f, init_temp, final_temp):
+def _write_initial_stress(f, mat_ids, init_stress):
+    """Write *INITIAL CONDITIONS, TYPE=STRESS for materials carrying one.
+
+    ``init_stress`` is {mat_id: [s1..s6]}; one row per material whose element
+    set exists in this model.
+    """
+    rows = [(mid, (init_stress or {}).get(mid)) for mid in mat_ids]
+    rows = [(mid, vals) for mid, vals in rows if vals]
+    if not rows:
+        return
+    f.write("*INITIAL CONDITIONS, TYPE=STRESS\n")
+    for mid, vals in rows:
+        f.write(f"eset{mid}, " + ", ".join(fmt_num(v) for v in vals[:6]) + "\n")
+
+
+def _write_step_submodel(f, init_temp, final_temp, mat_ids=(), init_stress=None):
     """Write the STEP block for a submodel."""
     f.write("*INITIAL CONDITIONS, TYPE=TEMPERATURE\n")
     f.write(f"NSET_TEMPERATURE,{fmt_num(init_temp)}\n")
+    _write_initial_stress(f, mat_ids, init_stress)
     f.write("*STEP, INC=10000, NAME=step, NLGEOM=NO\n")
     f.write("*STATIC\n")
     f.write("1.0, 1.0, 1.0e-15, 1.0\n")

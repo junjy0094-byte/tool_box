@@ -69,6 +69,15 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
    - .db 파일명이 "sub"로 끝나면(대소문자 무관, 예: model_sub.db) Sub-model 체크가
      자동으로 켜지고, 그렇지 않으면 자동으로 꺼집니다. File Selection 칸에서 직접
      체크/해제로 덮어쓸 수도 있습니다.
+   - 초기응력(Initial Stress): Sub-model 변환에서만 동작합니다. Step 1 에서
+     가장 번호가 작은 요소 하나만 ESEL 한 뒤 INISTATE,LIST 를 읽어, Model
+     Configuration 의 "Initial stress material #"(기본 991, 992)에 해당하고
+     값이 0 이 아닌 재질의 응력 6성분을 가져옵니다. CSYS 열은 무시합니다.
+   - 가져온 값은 INP 의 *INITIAL CONDITIONS, TYPE=TEMPERATURE 바로 아래에
+       *INITIAL CONDITIONS, TYPE=STRESS
+       eset991, s1, s2, s3, s4, s5, s6
+     형태로 재질마다 한 줄씩 들어갑니다. 초기응력이 없으면 이 블록 자체가
+     생기지 않습니다. 재질 번호 칸을 비우면 읽지 않습니다.
 
 8. MAPDL 실행 옵션
    - 병렬 모드는 SMP(-smp)로 고정되어 있습니다. MPI 등 다른 옵션이 필요하면
@@ -271,6 +280,8 @@ class ConverterApp:
         self.symmetry_mode = tk.StringVar(value=self.symmetry_options[0])
         self.has_orthotropic = tk.BooleanVar(value=True)
         self.ortho_mat_range = tk.StringVar(value="9990-9999")
+        # Submodel 변환 시 INISTATE 에서 초기응력을 읽어올 재질 번호.
+        self.inistate_mat_ids = tk.StringVar(value="991, 992")
         self.mapdl_version = tk.StringVar(value="242")
         self.nproc = tk.StringVar(value="4")
         # 동시에 돌릴 파일 개수 (1 이면 기존처럼 순차 실행)
@@ -428,6 +439,18 @@ class ConverterApp:
         tk.Entry(frm_model, textvariable=self.ortho_mat_range, width=14).grid(
             row=2, column=3, sticky="w", padx=5, pady=(5, 0)
         )
+
+        tk.Label(frm_model, text="Initial stress material #:").grid(
+            row=3, column=0, sticky="w", pady=(5, 0)
+        )
+        tk.Entry(frm_model, textvariable=self.inistate_mat_ids, width=14).grid(
+            row=3, column=1, sticky="w", padx=5, pady=(5, 0)
+        )
+        tk.Label(
+            frm_model,
+            text="(sub-model only: INISTATE 초기응력을 읽어올 재질 번호, 쉼표 구분. 비우면 생략)",
+            fg="#555555",
+        ).grid(row=3, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=(5, 0))
 
         frm_mapdl = tk.LabelFrame(self.root, text="MAPDL Launch Settings", padx=10, pady=5)
         frm_mapdl.pack(fill="x", padx=10, pady=5)
@@ -700,6 +723,24 @@ class ConverterApp:
             raise ValueError(f"Material # range must be like '9990-9999'. Got: '{text}'")
         return (lo, hi) if lo <= hi else (hi, lo)
 
+    def _parse_inistate_mat_ids(self):
+        """Parse the initial-stress material numbers ("991, 992")."""
+        text = self.inistate_mat_ids.get().strip()
+        if not text:
+            return ()
+        ids = []
+        for tok in text.replace(";", ",").replace(" ", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                ids.append(int(tok))
+            except ValueError:
+                raise ValueError(
+                    f"Initial stress material # must be integers like '991, 992'. Got: '{text}'"
+                )
+        return tuple(sorted(set(ids)))
+
     def _show_step1_log(self):
         log_path = self._step1_log_path
         if not log_path or not os.path.exists(log_path):
@@ -950,6 +991,7 @@ class ConverterApp:
             "symmetry_mode": self._symmetry_key(),
             "has_orthotropic": bool(self.has_orthotropic.get()),
             "ortho_mat_range": self._parse_ortho_mat_range(),
+            "inistate_mat_ids": self._parse_inistate_mat_ids(),
             "version": version,
             "nproc": nproc,
             "license_type": self.license_type.get().strip() or "preppost",
@@ -1613,6 +1655,19 @@ class ConverterApp:
         mapdl_ops.dump_mapdl_mplist(mapdl, mplist_path)
         log(f"Saved material metadata: {mplist_path}")
 
+        if job.is_submodel:
+            init_stress = mapdl_ops.get_initial_stress(
+                mapdl, log, opts["inistate_mat_ids"]
+            )
+            # 이전 실행에서 남은 값을 그대로 쓰지 않도록 비어 있어도 덮어쓴다.
+            inistate_path = os.path.join(job.data_dir, "step1_inistate.txt")
+            with open(inistate_path, "w") as f:
+                for mid in sorted(init_stress):
+                    f.write(f"[{mid}]\n")
+                    f.write(", ".join(str(v) for v in init_stress[mid]) + "\n\n")
+            if init_stress:
+                log(f"Saved initial stress metadata: {inistate_path}")
+
     def _step2_build_inp(self, job, opts, cdb_path, log):
         """CDB 직접 파싱 → Abaqus INP 템플릿 생성."""
         log("\n=== Step 2: direct text INP build (no fromansys) ===")
@@ -1643,6 +1698,16 @@ class ConverterApp:
             cdb_utils.read_materials_from_mplist_txt(mplist_txt)
             if os.path.exists(mplist_txt) else {}
         )
+
+        inistate_txt = os.path.join(data_dir, "step1_inistate.txt")
+        init_stress = (
+            cdb_utils.read_inistate_txt(inistate_txt)
+            if job.is_submodel and os.path.exists(inistate_txt) else {}
+        )
+        if init_stress:
+            log(f"Initial stress for material(s): "
+                f"{', '.join(str(m) for m in sorted(init_stress))}")
+
         mat_ids = sorted(mat_info.keys()) if mat_info else sorted(elems_by_mat.keys())
 
         if not nodes:
@@ -1663,6 +1728,7 @@ class ConverterApp:
             final_temp=final_temp,
             has_orthotropic=opts["has_orthotropic"],
             ortho_mat_range=ortho_mat_range,
+            init_stress=init_stress,
         )
         log(f"INP created: {inp_path}")
         log(

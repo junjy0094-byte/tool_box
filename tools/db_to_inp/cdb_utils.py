@@ -335,6 +335,35 @@ def read_nsets_txt(nset_path):
     return nsets
 
 
+def read_inistate_txt(inistate_path):
+    """Read initial-stress metadata written by _export_step1_metadata.
+
+    Format: a ``[mat_id]`` header followed by the six stress components.
+    Returns ``{mat_id: [s1..s6]}``.
+    """
+    data = {}
+    cur = None
+    num_pat = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[Ee][-+]?\d+)?")
+    with open(inistate_path, "r") as f:
+        for raw in f:
+            s = raw.strip()
+            if not s:
+                continue
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    cur = int(s[1:-1].strip())
+                except ValueError:
+                    cur = None
+                continue
+            if cur is None:
+                continue
+            vals = [float(t) for t in num_pat.findall(s)]
+            if len(vals) >= 6:
+                data[cur] = vals[:6]
+            cur = None
+    return data
+
+
 def read_materials_from_mplist_txt(mplist_path):
     """Parse MPLIST-like text tables.
 
