@@ -14,6 +14,17 @@ MP_LABELS = frozenset({
 })
 
 
+def _iter_lines(path):
+    """Yield a text file's lines one at a time.
+
+    큰 .cdb 를 readlines() 로 통째로 올리면 파일 크기의 몇 배를 메모리에
+    들고 있게 된다. 파서는 순차적으로만 읽으므로 흘려보내면 된다.
+    """
+    with open(path, "r") as f:
+        for line in f:
+            yield line
+
+
 def expand_etblock(cdb_path):
     """Replace every ETBLOCK block in a .cdb with ET/KEYOPT cards.
 
@@ -153,9 +164,6 @@ def parse_cdb_nodes(cdb_path):
     line (e.g. ``(3i9,6e21.13e3)``). Default widths: int_count=3,
     int_width=9, float_width=21.
     """
-    with open(cdb_path, "r") as f:
-        lines = f.readlines()
-
     nodes = {}
     in_nblock = False
     format_read = False
@@ -164,7 +172,7 @@ def parse_cdb_nodes(cdb_path):
     float_width = 21
     fmt_pat = re.compile(r"\(\s*(\d+)\s*[iI]\s*(\d+)\s*,\s*\d+\s*[eEdDfFgG]\s*(\d+)")
 
-    for raw in lines:
+    for raw in _iter_lines(cdb_path):
         line = raw.rstrip("\r\n")
         stripped = line.strip()
 
@@ -211,15 +219,12 @@ def parse_cdb_nodes(cdb_path):
 
 def parse_cdb_elements_by_mat(cdb_path):
     """Parse EBLOCK and return {mat_id: [(eid, [n1..n8]), ...]}."""
-    with open(cdb_path, "r") as f:
-        lines = f.readlines()
-
     elems_by_mat = defaultdict(list)
     in_eblock = False
     skip_format = False
     int_pat = re.compile(r"[-+]?\d+")
 
-    for raw in lines:
+    for raw in _iter_lines(cdb_path):
         s = raw.strip()
         u = s.upper()
         if not in_eblock and u.startswith("EBLOCK"):

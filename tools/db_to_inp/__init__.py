@@ -30,8 +30,7 @@ _HELP_DB = """\
     (파일명 앞/뒤 필터로 대상을 좁힐 수 있다)
   · Settings : Node Merge Tol, 초기/최종 온도, CDWRITE UNBLOCKED 여부
   · Model Configuration : 대칭 모드(Quarter / Full), 직교이방성 재질 사용 여부와
-    재질 번호 범위(기본 9990-9999), 초기응력 재질 번호(기본 991, 992),
-    Free Mesh 여부
+    재질 번호 범위(기본 9990-9999), Free Mesh 여부
   · MAPDL Launch Settings : ANSYS 버전, 프로세서 수, 라이선스 종류,
     동시 실행 파일 수(Parallel jobs)
 
@@ -95,7 +94,7 @@ _HELP_DB = """\
   · 현재 8절점 Hex 요소(C3D8I)만 지원한다. Free Mesh 는 체크하면 실행이 막힌다.
   · 대칭 모드 Half(1/2)는 미구현이라 실행이 막힌다.
   · Sub-model 변환에서는 INISTATE 초기응력이 있으면 *INITIAL CONDITIONS,
-    TYPE=STRESS 블록으로 함께 써 준다 (재질 번호는 Model Configuration 에서 지정).
+    TYPE=STRESS 블록으로 함께 써 준다 (값이 0 이 아닌 재질을 자동으로 찾는다).
   · Step 1 은 로컬에 ANSYS 가 설치되어 있어야 하고 ansys-mapdl-core 가 필요하다
     (pip install ansys-mapdl-core). Step 2 는 표준 라이브러리만으로 동작한다.
 """

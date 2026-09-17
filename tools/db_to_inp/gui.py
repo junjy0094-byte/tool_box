@@ -70,14 +70,14 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
      자동으로 켜지고, 그렇지 않으면 자동으로 꺼집니다. File Selection 칸에서 직접
      체크/해제로 덮어쓸 수도 있습니다.
    - 초기응력(Initial Stress): Sub-model 변환에서만 동작합니다. Step 1 에서
-     가장 번호가 작은 요소 하나만 ESEL 한 뒤 INISTATE,LIST 를 읽어, Model
-     Configuration 의 "Initial stress material #"(기본 991, 992)에 해당하고
-     값이 0 이 아닌 재질의 응력 6성분을 가져옵니다. CSYS 열은 무시합니다.
+     가장 번호가 작은 요소 하나만 ESEL 한 뒤 INISTATE,LIST 를 읽습니다.
+     그 목록에서 6성분이 모두 0 이 아닌 재질(matid)을 그대로 골라 오므로
+     재질 번호를 따로 지정할 필요가 없습니다. CSYS 열은 무시합니다.
    - 가져온 값은 INP 의 *INITIAL CONDITIONS, TYPE=TEMPERATURE 바로 아래에
        *INITIAL CONDITIONS, TYPE=STRESS
-       eset991, s1, s2, s3, s4, s5, s6
-     형태로 재질마다 한 줄씩 들어갑니다. 초기응력이 없으면 이 블록 자체가
-     생기지 않습니다. 재질 번호 칸을 비우면 읽지 않습니다.
+       eset901, s1, s2, s3, s4, s5, s6
+     형태로 재질마다 한 줄씩 들어갑니다. 초기응력이 없거나 해당 재질의
+     요소가 모델에 없으면 그 줄은 만들어지지 않습니다.
 
 8. MAPDL 실행 옵션
    - 병렬 모드는 SMP(-smp)로 고정되어 있습니다. MPI 등 다른 옵션이 필요하면
@@ -119,9 +119,12 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
 
 14. Stop 버튼
    - 아직 시작하지 않은 파일은 즉시 Cancelled 로 넘어갑니다.
-   - 이미 떠 있는 MAPDL 인스턴스는 바로 종료시킵니다. 정상 종료가 안 되면
-     우리가 띄운 PID 를 강제 종료(Windows: taskkill /F /T /PID)합니다.
-     따로 작업 관리자에서 죽일 필요가 없습니다.
+   - 이미 떠 있는 MAPDL 인스턴스는 바로 종료시킵니다. 먼저 프로세스를 죽인 뒤
+     exit() 을 부르므로, 응답이 없는 인스턴스에서도 바로 끝납니다
+     (Windows: taskkill /F /T /PID). 따로 작업 관리자에서 죽일 필요가 없습니다.
+   - 라이선스가 없거나 서버가 느려 기동 중(최대 120초 대기)에 눌러도 바로
+     멈춥니다. 기다리던 쪽은 즉시 포기하고, 뒤늦게 떠 버린 인스턴스는 뒤에서
+     따로 정리합니다.
    - 진행 중이던 MAPDL 명령은 그 과정에서 끊기며, 해당 파일은 실패가 아니라
      Cancelled 로 기록됩니다.
    - 중단된 파일의 .inp 는 만들어지지 않습니다.
@@ -280,8 +283,6 @@ class ConverterApp:
         self.symmetry_mode = tk.StringVar(value=self.symmetry_options[0])
         self.has_orthotropic = tk.BooleanVar(value=True)
         self.ortho_mat_range = tk.StringVar(value="9990-9999")
-        # Submodel 변환 시 INISTATE 에서 초기응력을 읽어올 재질 번호.
-        self.inistate_mat_ids = tk.StringVar(value="991, 992")
         self.mapdl_version = tk.StringVar(value="242")
         self.nproc = tk.StringVar(value="4")
         # 동시에 돌릴 파일 개수 (1 이면 기존처럼 순차 실행)
@@ -439,18 +440,6 @@ class ConverterApp:
         tk.Entry(frm_model, textvariable=self.ortho_mat_range, width=14).grid(
             row=2, column=3, sticky="w", padx=5, pady=(5, 0)
         )
-
-        tk.Label(frm_model, text="Initial stress material #:").grid(
-            row=3, column=0, sticky="w", pady=(5, 0)
-        )
-        tk.Entry(frm_model, textvariable=self.inistate_mat_ids, width=14).grid(
-            row=3, column=1, sticky="w", padx=5, pady=(5, 0)
-        )
-        tk.Label(
-            frm_model,
-            text="(sub-model only: INISTATE 초기응력을 읽어올 재질 번호, 쉼표 구분. 비우면 생략)",
-            fg="#555555",
-        ).grid(row=3, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=(5, 0))
 
         frm_mapdl = tk.LabelFrame(self.root, text="MAPDL Launch Settings", padx=10, pady=5)
         frm_mapdl.pack(fill="x", padx=10, pady=5)
@@ -723,24 +712,6 @@ class ConverterApp:
             raise ValueError(f"Material # range must be like '9990-9999'. Got: '{text}'")
         return (lo, hi) if lo <= hi else (hi, lo)
 
-    def _parse_inistate_mat_ids(self):
-        """Parse the initial-stress material numbers ("991, 992")."""
-        text = self.inistate_mat_ids.get().strip()
-        if not text:
-            return ()
-        ids = []
-        for tok in text.replace(";", ",").replace(" ", ",").split(","):
-            tok = tok.strip()
-            if not tok:
-                continue
-            try:
-                ids.append(int(tok))
-            except ValueError:
-                raise ValueError(
-                    f"Initial stress material # must be integers like '991, 992'. Got: '{text}'"
-                )
-        return tuple(sorted(set(ids)))
-
     def _show_step1_log(self):
         log_path = self._step1_log_path
         if not log_path or not os.path.exists(log_path):
@@ -991,7 +962,6 @@ class ConverterApp:
             "symmetry_mode": self._symmetry_key(),
             "has_orthotropic": bool(self.has_orthotropic.get()),
             "ortho_mat_range": self._parse_ortho_mat_range(),
-            "inistate_mat_ids": self._parse_inistate_mat_ids(),
             "version": version,
             "nproc": nproc,
             "license_type": self.license_type.get().strip() or "preppost",
@@ -1118,9 +1088,15 @@ class ConverterApp:
             if log:
                 log(f"  Killed leftover MAPDL process (pid {pid}).")
 
-    def _shutdown_mapdl(self, mapdl, log=None):
-        """인스턴스 하나를 닫고, 그래도 살아 있으면 PID 로 강제 종료한다."""
+    def _shutdown_mapdl(self, mapdl, log=None, kill_first=False):
+        """인스턴스 하나를 닫고, 그래도 살아 있으면 PID 로 강제 종료한다.
+
+        ``kill_first`` 는 Stop 용이다. 먼저 프로세스를 죽여 두면 exit() 이
+        응답 없는 gRPC 채널을 붙잡고 늘어지지 않고 바로 끝난다.
+        """
         pid = self._mapdl_pid(mapdl)
+        if kill_first and pid:
+            self._kill_pid(pid)
         try:
             mapdl.exit()
         except Exception:
@@ -1142,7 +1118,7 @@ class ConverterApp:
         끊기며 해당 파일은 Cancelled 로 처리된다.
         """
         for mapdl in list(self._active_mapdl):
-            self._shutdown_mapdl(mapdl)
+            self._shutdown_mapdl(mapdl, kill_first=True)
         self._kill_leftover_processes()
         self._log("*** MAPDL instances shut down. ***")
 
@@ -1366,7 +1342,8 @@ class ConverterApp:
         while time.time() < deadline:
             if not self._port_is_free(port):
                 return True
-            time.sleep(0.5)
+            if self._stop_event.wait(0.5):
+                return False
         return not self._port_is_free(port)
 
     @staticmethod
@@ -1477,7 +1454,7 @@ class ConverterApp:
         return kwargs
 
     @staticmethod
-    def _call_launch_mapdl(launch_mapdl, kwargs):
+    def _invoke_launch_mapdl(launch_mapdl, kwargs):
         try:
             return launch_mapdl(**kwargs)
         except TypeError:
@@ -1487,6 +1464,48 @@ class ConverterApp:
             if trimmed == kwargs:
                 raise
             return launch_mapdl(**trimmed)
+
+    def _call_launch_mapdl(self, launch_mapdl, kwargs, log):
+        """기동 호출은 별도 스레드에 맡기고, Stop 이면 기다리지 않고 나온다.
+
+        라이선스가 없거나 서버가 느리면 PyMAPDL 이 start_timeout(최대 120초)
+        동안 붙잡고 있어서 Stop 을 눌러도 그때까지 아무 반응이 없다. 기다리는
+        쪽만 먼저 포기하고, 뒤늦게 떠 버린 인스턴스는 뒷정리 스레드가 닫는다.
+        """
+        result = {}
+
+        def _worker():
+            try:
+                result["mapdl"] = self._invoke_launch_mapdl(launch_mapdl, kwargs)
+            except BaseException as e:  # noqa: BLE001 - 호출한 쪽에서 그대로 다시 올린다
+                result["error"] = e
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            if self._stop_event.wait(0.2):
+                log("  Stop requested — abandoning the MAPDL launch.")
+                threading.Thread(
+                    target=self._discard_launch,
+                    args=(thread, result, kwargs.get("port")),
+                    daemon=True,
+                ).start()
+                raise _Aborted()
+        if "error" in result:
+            raise result["error"]
+        return result["mapdl"]
+
+    def _discard_launch(self, thread, result, port):
+        """Stop 으로 버린 기동이 뒤늦게 성공해도 프로세스를 남기지 않는다."""
+        thread.join(timeout=MAPDL_START_TIMEOUT + 60)
+        mapdl = result.get("mapdl")
+        if mapdl is not None:
+            self._shutdown_mapdl(mapdl, kill_first=True)
+        if port:
+            pid = self._pid_on_port(port)
+            if pid:
+                self._kill_pid(pid)
+        self._kill_leftover_processes()
 
     def _launch_mapdl(self, launch_mapdl, out_dir, opts, log):
         """최대 2번 시도하고, 실패하면 원인을 로그에 남긴다."""
@@ -1504,7 +1523,7 @@ class ConverterApp:
                                   if k != "run_location")
                 log(f"Launching MAPDL (attempt {attempt}/{total}): {shown}")
                 try:
-                    mapdl = self._call_launch_mapdl(launch_mapdl, kwargs)
+                    mapdl = self._call_launch_mapdl(launch_mapdl, kwargs, log)
                     return self._track_instance(mapdl, log)
                 except _Aborted:
                     raise
@@ -1528,7 +1547,8 @@ class ConverterApp:
                     self._kill_leftover_processes(log)
             if attempt < total:
                 log("  Retrying in 3 s ...")
-                time.sleep(3)
+                if self._stop_event.wait(3):
+                    raise _Aborted()
         raise RuntimeError(f"{type(last_err).__name__}: {last_err}\n{MAPDL_LAUNCH_HINT}")
 
     def _track_instance(self, mapdl, log):
@@ -1656,9 +1676,7 @@ class ConverterApp:
         log(f"Saved material metadata: {mplist_path}")
 
         if job.is_submodel:
-            init_stress = mapdl_ops.get_initial_stress(
-                mapdl, log, opts["inistate_mat_ids"]
-            )
+            init_stress = mapdl_ops.get_initial_stress(mapdl, log)
             # 이전 실행에서 남은 값을 그대로 쓰지 않도록 비어 있어도 덮어쓴다.
             inistate_path = os.path.join(job.data_dir, "step1_inistate.txt")
             with open(inistate_path, "w") as f:
