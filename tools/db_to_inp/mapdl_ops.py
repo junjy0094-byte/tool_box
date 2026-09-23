@@ -257,6 +257,21 @@ def get_component_node_ids_by_keywords(mapdl, include):
 # Component creation
 # ---------------------------------------------------------------------------
 
+def _id_ranges(ids):
+    """Group consecutive IDs into (start, end) ranges.
+
+    NSEL/ESEL 을 번호 하나에 한 줄씩 쓰면 절점 수만큼 APDL 명령이 생겨 아주
+    느리다. 연속 구간으로 묶으면 보통 줄 수가 수백 분의 일로 줄어든다.
+    """
+    ranges = []
+    for v in sorted({int(i) for i in ids}):
+        if ranges and v == ranges[-1][1] + 1:
+            ranges[-1][1] = v
+        else:
+            ranges.append([v, v])
+    return ranges
+
+
 def create_cm_from_node_list(mapdl, cm_name, nodes, as_elements=False, log_fn=None):
     """Select node numbers and save component as NODE or ELEM via macro."""
     if not nodes:
@@ -266,8 +281,8 @@ def create_cm_from_node_list(mapdl, cm_name, nodes, as_elements=False, log_fn=No
         with open(macro_path, "w") as f:
             f.write("ALLSEL,ALL\n")
             f.write("NSEL,NONE\n")
-            for node in sorted(nodes):
-                f.write(f"NSEL,A,NODE,,{node}\n")
+            for start, end in _id_ranges(nodes):
+                f.write(f"NSEL,A,NODE,,{start},{end}\n")
             if as_elements:
                 f.write("ESLN,S\n")
                 f.write(f"CM,{cm_name},ELEM\n")
@@ -291,8 +306,8 @@ def create_cm_from_element_list(mapdl, cm_name, elems, log_fn=None):
         with open(macro_path, "w") as f:
             f.write("ALLSEL,ALL\n")
             f.write("ESEL,NONE\n")
-            for eid in sorted(elems):
-                f.write(f"ESEL,A,ELEM,,{eid}\n")
+            for start, end in _id_ranges(elems):
+                f.write(f"ESEL,A,ELEM,,{start},{end}\n")
             f.write(f"CM,{cm_name},ELEM\n")
             f.write("ALLSEL,ALL\n")
         mapdl.input(macro_path)
@@ -301,6 +316,31 @@ def create_cm_from_element_list(mapdl, cm_name, elems, log_fn=None):
         if log_fn:
             log_fn(f"  Warning: failed to create {cm_name} from elements: {e}")
         return False
+
+
+def delete_components(mapdl, names, log_fn=None):
+    """Delete component names in one macro instead of one call per name."""
+    names = [n for n in names]
+    if not names:
+        return 0
+    macro_path = os.path.join(mapdl.directory, "_cmdele.mac")
+    try:
+        with open(macro_path, "w") as f:
+            for name in names:
+                f.write(f"CMDELE,{name}\n")
+        mapdl.input(macro_path)
+        return len(names)
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  Warning: batch CMDELE failed ({e}); deleting one by one.")
+        deleted = 0
+        for name in names:
+            try:
+                mapdl.cmdele(name)
+                deleted += 1
+            except Exception:
+                pass
+        return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -450,14 +490,7 @@ def handle_ties_and_loads(mapdl, log_fn, is_submodel=False):
 
     if is_submodel:
         log_fn("  Submodel mode: skipping tie detection.")
-        existing_cms = list_all_components(mapdl)
-        deleted_cm = 0
-        for name in existing_cms:
-            try:
-                mapdl.cmdele(name)
-                deleted_cm += 1
-            except Exception:
-                pass
+        deleted_cm = delete_components(mapdl, list_all_components(mapdl), log_fn)
         log_fn(f"  Removed {deleted_cm} component name(s).")
         for cmd_name, args in load_cmds:
             try:
@@ -549,19 +582,15 @@ def handle_ties_and_loads(mapdl, log_fn, is_submodel=False):
 
     mapdl.allsel("ALL")
 
-    existing_cms = list_all_components(mapdl)
-    deleted_cm = 0
-    for name in existing_cms:
-        if name.upper() in created_cms:
-            continue
+    doomed = []
+    for name in list_all_components(mapdl):
         up = name.upper()
+        if up in created_cms:
+            continue
         if "TIE" in up or "MASTER" in up or "SLAVE" in up:
             continue
-        try:
-            mapdl.cmdele(name)
-            deleted_cm += 1
-        except Exception:
-            pass
+        doomed.append(name)
+    deleted_cm = delete_components(mapdl, doomed, log_fn)
     log_fn(f"  Removed {deleted_cm} non-tie component name(s).")
 
     for cmd_name, args in load_cmds:
@@ -593,6 +622,12 @@ def remove_unused_mats(mapdl, log_fn):
     except Exception:
         log_fn("  Warning: Could not bulk-read element MAT attrs, skipping.")
         return
+    finally:
+        # 요소 수만큼 잡은 배열이다. 그대로 두면 save/CDWRITE 까지 따라간다.
+        try:
+            mapdl.run("*DEL,_MATARR,,NOPR")
+        except Exception:
+            pass
 
     macro_path = os.path.join(mapdl.directory, "_dump_mplist.mac")
     with open(macro_path, "w") as f:
@@ -619,16 +654,28 @@ def remove_unused_mats(mapdl, log_fn):
     log_fn(f"  {len(unused)} unused material(s) to delete...")
 
     deleted = 0
-    for mid in unused:
+    if unused:
+        # 재질마다 왕복하면 느리다. 매크로 한 번으로 한꺼번에 지운다.
+        del_macro = os.path.join(mapdl.directory, "_mpdele.mac")
         try:
-            mapdl.mpdele("ALL", mid)
-        except Exception:
-            pass
-        try:
-            mapdl.tbdele("ALL", mid)
-        except Exception:
-            pass
-        deleted += 1
+            with open(del_macro, "w") as f:
+                for mid in unused:
+                    f.write(f"MPDELE,ALL,{mid}\n")
+                    f.write(f"TBDELE,ALL,{mid}\n")
+            mapdl.input(del_macro)
+            deleted = len(unused)
+        except Exception as e:
+            log_fn(f"  Warning: batch material delete failed ({e}); one by one.")
+            for mid in unused:
+                try:
+                    mapdl.mpdele("ALL", mid)
+                except Exception:
+                    pass
+                try:
+                    mapdl.tbdele("ALL", mid)
+                except Exception:
+                    pass
+                deleted += 1
 
     log_fn(f"  Deleted {deleted} / {len(all_mats)} unused material(s).")
 
@@ -787,3 +834,100 @@ def dump_mapdl_mplist(mapdl, mplist_path):
     except Exception:
         with open(mplist_path, "w") as f:
             f.write("")
+
+
+# ---------------------------------------------------------------------------
+# Initial state (initial stress)
+# ---------------------------------------------------------------------------
+
+# INISTATE,LIST 한 줄의 열 순서: matid, csys, s1..s6 (csys 는 쓰지 않는다).
+_INISTATE_NCOL = 8
+_INISTATE_NCOMP = 6
+
+
+def _inistate_float(tok):
+    """Convert one INISTATE,LIST token to float, or None if it is not a number.
+
+    MAPDL 가 소수점을 두 번 찍어 내보내는 경우(0..0000e+00)가 있어 함께 받는다.
+    """
+    try:
+        return float(tok.replace("..", ".").replace("D", "E").replace("d", "e"))
+    except ValueError:
+        return None
+
+
+def parse_inistate_list(text):
+    """Parse INISTATE,LIST output into ``{mat_id: [s1..s6]}``.
+
+    Data rows are ``matid, csys, s1..s6`` — the CSYS column is dropped and the
+    six stress components after it are kept. Every material listed with a
+    non-zero component is returned; all-zero materials and header lines are
+    skipped, and the first non-zero row wins per material.
+    """
+    result = {}
+    for raw in str(text).splitlines():
+        toks = raw.split()
+        if len(toks) != _INISTATE_NCOL:
+            continue
+        vals = [_inistate_float(t) for t in toks]
+        if any(v is None for v in vals):
+            continue
+        mat = int(vals[0])
+        stress = vals[_INISTATE_NCOL - _INISTATE_NCOMP:]
+        if mat in result or all(v == 0.0 for v in stress):
+            continue
+        result[mat] = stress
+    return result
+
+
+def get_initial_stress(mapdl, log_fn):
+    """Return ``{mat_id: [s1..s6]}`` initial stress read from the model.
+
+    The lowest-numbered element is selected on its own and INISTATE,LIST is
+    parsed from its output; every material carrying non-zero initial stress is
+    returned. An empty dict means the model has no initial stress.
+    """
+    try:
+        mapdl.allsel("ALL")
+        min_eid = int(mapdl.get("MINEL", "ELEM", "", "NUM", "MIN"))
+    except Exception as e:
+        log_fn(f"  Warning: could not query the lowest element number: {e}")
+        return {}
+    if min_eid <= 0:
+        log_fn("  No elements found, skipping initial stress.")
+        return {}
+
+    macro_path = os.path.join(mapdl.directory, "_dump_inistate.mac")
+    try:
+        with open(macro_path, "w") as f:
+            f.write("ALLSEL,ALL\n")
+            f.write(f"ESEL,S,ELEM,,{min_eid}\n")
+            f.write("/OUTPUT,_inistate,txt\n")
+            f.write("INISTATE,LIST\n")
+            f.write("/OUTPUT\n")
+            f.write("ALLSEL,ALL\n")
+        mapdl.input(macro_path)
+    except Exception as e:
+        log_fn(f"  Warning: INISTATE,LIST failed: {e}")
+        return {}
+    finally:
+        try:
+            mapdl.allsel("ALL")
+        except Exception:
+            pass
+
+    try:
+        with open(os.path.join(mapdl.directory, "_inistate.txt"), "r") as f:
+            text = f.read()
+    except OSError:
+        log_fn("  INISTATE,LIST produced no output; no initial stress.")
+        return {}
+
+    stresses = parse_inistate_list(text)
+    if not stresses:
+        log_fn(f"  No initial stress on element {min_eid}.")
+        return {}
+    for mid in sorted(stresses):
+        vals = ", ".join(f"{v:.6g}" for v in stresses[mid])
+        log_fn(f"  Initial stress mat {mid}: {vals}")
+    return stresses

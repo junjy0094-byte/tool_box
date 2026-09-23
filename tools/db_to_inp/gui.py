@@ -69,6 +69,21 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
    - .db 파일명이 "sub"로 끝나면(대소문자 무관, 예: model_sub.db) Sub-model 체크가
      자동으로 켜지고, 그렇지 않으면 자동으로 꺼집니다. File Selection 칸에서 직접
      체크/해제로 덮어쓸 수도 있습니다.
+   - 초기응력(Initial Stress): Sub-model 변환에서만 동작합니다. Step 1 에서
+     가장 번호가 작은 요소 하나만 ESEL 한 뒤 INISTATE,LIST 를 읽습니다.
+     그 목록에서 6성분이 모두 0 이 아닌 재질(matid)을 그대로 골라 오므로
+     재질 번호를 따로 지정할 필요가 없습니다. CSYS 열은 무시합니다.
+   - 가져온 값은 INP 의 *INITIAL CONDITIONS, TYPE=TEMPERATURE 바로 아래에
+       *INITIAL CONDITIONS, TYPE=STRESS
+       eset901, s1, s2, s3, s4, s5, s6
+     형태로 재질마다 한 줄씩 들어갑니다. 초기응력이 없거나 해당 재질의
+     요소가 모델에 없으면 그 줄은 만들어지지 않습니다.
+
+7-1. clean_model.db 저장
+   - Settings 의 "Save cleaned model as clean_model.db" 는 기본이 꺼져 있습니다.
+   - 정리된 모델을 ANSYS 에서 다시 열어 볼 때만 필요한 보관용 파일입니다.
+     .inp 변환(Step 2)은 clean_model.cdb 만 읽으므로 꺼도 결과는 같습니다.
+   - 큰 모델일수록 저장에 시간이 걸리므로, 필요할 때만 켜세요.
 
 8. MAPDL 실행 옵션
    - 병렬 모드는 SMP(-smp)로 고정되어 있습니다. MPI 등 다른 옵션이 필요하면
@@ -110,9 +125,12 @@ ANSYS -> Abaqus Converter : 참고 사항 (Notes)
 
 14. Stop 버튼
    - 아직 시작하지 않은 파일은 즉시 Cancelled 로 넘어갑니다.
-   - 이미 떠 있는 MAPDL 인스턴스는 바로 종료시킵니다. 정상 종료가 안 되면
-     우리가 띄운 PID 를 강제 종료(Windows: taskkill /F /T /PID)합니다.
-     따로 작업 관리자에서 죽일 필요가 없습니다.
+   - 이미 떠 있는 MAPDL 인스턴스는 바로 종료시킵니다. 먼저 프로세스를 죽인 뒤
+     exit() 을 부르므로, 응답이 없는 인스턴스에서도 바로 끝납니다
+     (Windows: taskkill /F /T /PID). 따로 작업 관리자에서 죽일 필요가 없습니다.
+   - 라이선스가 없거나 서버가 느려 기동 중(최대 120초 대기)에 눌러도 바로
+     멈춥니다. 기다리던 쪽은 즉시 포기하고, 뒤늦게 떠 버린 인스턴스는 뒤에서
+     따로 정리합니다.
    - 진행 중이던 MAPDL 명령은 그 과정에서 끊기며, 해당 파일은 실패가 아니라
      Cancelled 로 기록됩니다.
    - 중단된 파일의 .inp 는 만들어지지 않습니다.
@@ -261,6 +279,9 @@ class ConverterApp:
         # NOTE: the built-in CDB parser (Step 2) requires BLOCKED nblock/eblock,
         # so a full Step 2 run forces BLOCKED regardless of this flag.
         self.cdwrite_unblocked = tk.BooleanVar(value=True)
+        # 정리된 모델을 clean_model.db 로 남길지. Step 2 는 .cdb 만 읽으므로
+        # 보관용이며, 큰 모델에서는 저장 시간이 길어 기본은 꺼 둔다.
+        self.save_clean_db = tk.BooleanVar(value=False)
         self.is_submodel = tk.BooleanVar(value=False)
         self.free_mesh = tk.BooleanVar(value=False)
         self.symmetry_options = [
@@ -404,6 +425,13 @@ class ConverterApp:
             text="CDWRITE UNBLOCKED (HyperMesh compatible; auto-disabled for full Step 2 run)",
             variable=self.cdwrite_unblocked,
         ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(5, 0))
+
+        tk.Checkbutton(
+            frm_set,
+            text="Save cleaned model as clean_model.db (보관용 — .inp 변환에는 쓰지 않음, "
+                 "큰 모델에서는 느려짐)",
+            variable=self.save_clean_db,
+        ).grid(row=2, column=0, columnspan=6, sticky="w")
 
         frm_model = tk.LabelFrame(self.root, text="Model Configuration", padx=10, pady=5)
         frm_model.pack(fill="x", padx=10, pady=5)
@@ -947,6 +975,7 @@ class ConverterApp:
             "init_temp": init_temp,
             "final_temp": final_temp,
             "cdwrite_unblocked": bool(self.cdwrite_unblocked.get()),
+            "save_clean_db": bool(self.save_clean_db.get()),
             "symmetry_mode": self._symmetry_key(),
             "has_orthotropic": bool(self.has_orthotropic.get()),
             "ortho_mat_range": self._parse_ortho_mat_range(),
@@ -1076,9 +1105,15 @@ class ConverterApp:
             if log:
                 log(f"  Killed leftover MAPDL process (pid {pid}).")
 
-    def _shutdown_mapdl(self, mapdl, log=None):
-        """인스턴스 하나를 닫고, 그래도 살아 있으면 PID 로 강제 종료한다."""
+    def _shutdown_mapdl(self, mapdl, log=None, kill_first=False):
+        """인스턴스 하나를 닫고, 그래도 살아 있으면 PID 로 강제 종료한다.
+
+        ``kill_first`` 는 Stop 용이다. 먼저 프로세스를 죽여 두면 exit() 이
+        응답 없는 gRPC 채널을 붙잡고 늘어지지 않고 바로 끝난다.
+        """
         pid = self._mapdl_pid(mapdl)
+        if kill_first and pid:
+            self._kill_pid(pid)
         try:
             mapdl.exit()
         except Exception:
@@ -1100,7 +1135,7 @@ class ConverterApp:
         끊기며 해당 파일은 Cancelled 로 처리된다.
         """
         for mapdl in list(self._active_mapdl):
-            self._shutdown_mapdl(mapdl)
+            self._shutdown_mapdl(mapdl, kill_first=True)
         self._kill_leftover_processes()
         self._log("*** MAPDL instances shut down. ***")
 
@@ -1324,7 +1359,8 @@ class ConverterApp:
         while time.time() < deadline:
             if not self._port_is_free(port):
                 return True
-            time.sleep(0.5)
+            if self._stop_event.wait(0.5):
+                return False
         return not self._port_is_free(port)
 
     @staticmethod
@@ -1435,7 +1471,7 @@ class ConverterApp:
         return kwargs
 
     @staticmethod
-    def _call_launch_mapdl(launch_mapdl, kwargs):
+    def _invoke_launch_mapdl(launch_mapdl, kwargs):
         try:
             return launch_mapdl(**kwargs)
         except TypeError:
@@ -1445,6 +1481,48 @@ class ConverterApp:
             if trimmed == kwargs:
                 raise
             return launch_mapdl(**trimmed)
+
+    def _call_launch_mapdl(self, launch_mapdl, kwargs, log):
+        """기동 호출은 별도 스레드에 맡기고, Stop 이면 기다리지 않고 나온다.
+
+        라이선스가 없거나 서버가 느리면 PyMAPDL 이 start_timeout(최대 120초)
+        동안 붙잡고 있어서 Stop 을 눌러도 그때까지 아무 반응이 없다. 기다리는
+        쪽만 먼저 포기하고, 뒤늦게 떠 버린 인스턴스는 뒷정리 스레드가 닫는다.
+        """
+        result = {}
+
+        def _worker():
+            try:
+                result["mapdl"] = self._invoke_launch_mapdl(launch_mapdl, kwargs)
+            except BaseException as e:  # noqa: BLE001 - 호출한 쪽에서 그대로 다시 올린다
+                result["error"] = e
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            if self._stop_event.wait(0.2):
+                log("  Stop requested — abandoning the MAPDL launch.")
+                threading.Thread(
+                    target=self._discard_launch,
+                    args=(thread, result, kwargs.get("port")),
+                    daemon=True,
+                ).start()
+                raise _Aborted()
+        if "error" in result:
+            raise result["error"]
+        return result["mapdl"]
+
+    def _discard_launch(self, thread, result, port):
+        """Stop 으로 버린 기동이 뒤늦게 성공해도 프로세스를 남기지 않는다."""
+        thread.join(timeout=MAPDL_START_TIMEOUT + 60)
+        mapdl = result.get("mapdl")
+        if mapdl is not None:
+            self._shutdown_mapdl(mapdl, kill_first=True)
+        if port:
+            pid = self._pid_on_port(port)
+            if pid:
+                self._kill_pid(pid)
+        self._kill_leftover_processes()
 
     def _launch_mapdl(self, launch_mapdl, out_dir, opts, log):
         """최대 2번 시도하고, 실패하면 원인을 로그에 남긴다."""
@@ -1462,7 +1540,7 @@ class ConverterApp:
                                   if k != "run_location")
                 log(f"Launching MAPDL (attempt {attempt}/{total}): {shown}")
                 try:
-                    mapdl = self._call_launch_mapdl(launch_mapdl, kwargs)
+                    mapdl = self._call_launch_mapdl(launch_mapdl, kwargs, log)
                     return self._track_instance(mapdl, log)
                 except _Aborted:
                     raise
@@ -1486,7 +1564,8 @@ class ConverterApp:
                     self._kill_leftover_processes(log)
             if attempt < total:
                 log("  Retrying in 3 s ...")
-                time.sleep(3)
+                if self._stop_event.wait(3):
+                    raise _Aborted()
         raise RuntimeError(f"{type(last_err).__name__}: {last_err}\n{MAPDL_LAUNCH_HINT}")
 
     def _track_instance(self, mapdl, log):
@@ -1552,10 +1631,13 @@ class ConverterApp:
 
             mapdl.allsel("ALL")
 
-            db_name = "clean_model"
-            log(f"Saving cleaned model as {db_name}.db ...")
-            mapdl.save(db_name, "db")
-            log(f"{db_name}.db saved.")
+            if opts["save_clean_db"]:
+                db_name = "clean_model"
+                log(f"Saving cleaned model as {db_name}.db ...")
+                mapdl.save(db_name, "db")
+                log(f"{db_name}.db saved.")
+            else:
+                log("Skipping clean_model.db save (option off).")
 
             cdb_name = "clean_model"
             is_full_run = not opts["stop_after_step1"]
@@ -1613,6 +1695,17 @@ class ConverterApp:
         mapdl_ops.dump_mapdl_mplist(mapdl, mplist_path)
         log(f"Saved material metadata: {mplist_path}")
 
+        if job.is_submodel:
+            init_stress = mapdl_ops.get_initial_stress(mapdl, log)
+            # 이전 실행에서 남은 값을 그대로 쓰지 않도록 비어 있어도 덮어쓴다.
+            inistate_path = os.path.join(job.data_dir, "step1_inistate.txt")
+            with open(inistate_path, "w") as f:
+                for mid in sorted(init_stress):
+                    f.write(f"[{mid}]\n")
+                    f.write(", ".join(str(v) for v in init_stress[mid]) + "\n\n")
+            if init_stress:
+                log(f"Saved initial stress metadata: {inistate_path}")
+
     def _step2_build_inp(self, job, opts, cdb_path, log):
         """CDB 직접 파싱 → Abaqus INP 템플릿 생성."""
         log("\n=== Step 2: direct text INP build (no fromansys) ===")
@@ -1643,6 +1736,16 @@ class ConverterApp:
             cdb_utils.read_materials_from_mplist_txt(mplist_txt)
             if os.path.exists(mplist_txt) else {}
         )
+
+        inistate_txt = os.path.join(data_dir, "step1_inistate.txt")
+        init_stress = (
+            cdb_utils.read_inistate_txt(inistate_txt)
+            if job.is_submodel and os.path.exists(inistate_txt) else {}
+        )
+        if init_stress:
+            log(f"Initial stress for material(s): "
+                f"{', '.join(str(m) for m in sorted(init_stress))}")
+
         mat_ids = sorted(mat_info.keys()) if mat_info else sorted(elems_by_mat.keys())
 
         if not nodes:
@@ -1663,6 +1766,7 @@ class ConverterApp:
             final_temp=final_temp,
             has_orthotropic=opts["has_orthotropic"],
             ortho_mat_range=ortho_mat_range,
+            init_stress=init_stress,
         )
         log(f"INP created: {inp_path}")
         log(
