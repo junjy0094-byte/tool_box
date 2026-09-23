@@ -286,10 +286,11 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                bounds and cell boundaries for every layer.
         x_edges / y_edges: Alternative direct-array form of x_coords_csv /
                y_coords_csv, primarily for programmatic callers.
-        export_apdl: If True, also write an APDL macro (.mac) per layer --
-               the "reference full model": one 2D element per raster
-               sub-pixel, MAT=1 (Cu) / MAT=2 (PPG), matching the display
-               panel exactly. See apdl_export.write_reference_full_model_apdl.
+        export_apdl: If True, also write the APDL "reference full model":
+               <layer>_node.mac / <layer>_elem.mac per layer plus a
+               reference_full_model.mac driver that /INPUTs them -- one
+               SOLID185 element per raster sub-pixel, layers stacked in Z,
+               MAT=1 (Cu) / MAT=2 (PPG), matching the display panel exactly. See apdl_export.write_reference_full_model_apdl.
                Element count scales with min_display_pixels and can be
                very large; use apdl_stride to bound it.
         apdl_stride: Use every Nth raster sub-pixel per axis for the
@@ -435,10 +436,6 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
             csv_path = out_base / f"{stem}.csv"
             mapper.to_csv(str(csv_path))
 
-        if export_apdl:
-            apdl_path = out_base / f"{stem}_reference_full.mac"
-            write_reference_full_model_apdl(mapper, str(apdl_path), stride=apdl_stride)
-
         if plot:
             stub = parsed.get(fp) or type('LayerStub', (), {
                 'name': name, 'filepath': fp,
@@ -451,6 +448,11 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
             print(f"Plot saved: {png_path}")
 
         results[name] = mapper
+
+    if export_apdl and results:
+        first_fp = next(iter(effective.keys()))
+        apdl_dir = Path(outdir) if outdir else Path(first_fp).parent
+        write_reference_full_model_apdl(results, apdl_dir, stride=apdl_stride)
 
     # --- Step 4: All-layer summary plot ---
     if plot and len(results) > 1:

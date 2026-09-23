@@ -136,8 +136,9 @@ def main():
         'against a ground-truth model.')
     apdl_group.add_argument(
         '--reference-full-model', action='store_true',
-        help='Write an APDL macro (.mac) per layer: one 2D element per '
-             'raster sub-pixel, MAT=1 (Cu) / MAT=2 (PPG placeholder '
+        help='Write APDL node/elem macros per layer plus a '
+             'reference_full_model.mac driver: one SOLID185 element per '
+             'raster sub-pixel, layers stacked in Z, MAT=1 (Cu) / MAT=2 (PPG placeholder '
              'properties). Element count scales with --display-pixels '
              'and can be very large -- see --reference-full-stride.')
     apdl_group.add_argument(

@@ -185,8 +185,11 @@
                               머리말에 격자 크기·범위·(커스텀이면) 셀 경계가 들어감
   · <층>.png                  동박 형상 + 비율 맵 그림
   · all_layers_summary.png    전체 층 요약 그림
-  · <층>_reference_full.mac   (옵션) 래스터 서브픽셀 1개당 2D 요소 1개인
-                              APDL 참조 모델. 매우 커질 수 있어 Stride 로 줄인다.
+  · <층>_node.mac / <층>_elem.mac, reference_full_model.mac
+                              (옵션) 래스터 서브픽셀 1개당 SOLID185 요소 1개인
+                              APDL 참조 모델. 층별 노드/요소 파일을 실행 파일이
+                              /NOPR·/INPUT·/GOPR 로 불러오고 층은 Z 로 쌓인다.
+                              매우 커질 수 있어 Stride 로 줄인다.
   · 래스터 캐시(.npz)         같은 파일을 다시 처리할 때 재사용
 
 [ 사용 순서 ]
