@@ -146,6 +146,12 @@ def main():
         help='Use every Nth raster sub-pixel per axis for the reference '
              'full model instead of all of them, to bound element count. '
              '1 (default) = exact match to the display panel.')
+    apdl_group.add_argument(
+        '--reference-full-thickness', type=float, nargs='+', default=[0.035],
+        metavar='T',
+        help='Z thickness (mm) per layer for the reference full model: one '
+             'value for all layers, or one per layer in input order '
+             '(bottom -> top). Default 0.035.')
 
     args = parser.parse_args()
 
@@ -189,6 +195,16 @@ def main():
               "this can be a very large mesh.")
     print()
 
+    apdl_thickness = args.reference_full_thickness
+    if len(apdl_thickness) == 1:
+        apdl_thickness = apdl_thickness[0]
+    elif args.reference_full_model:
+        if len(apdl_thickness) != len(files):
+            parser.error(f"--reference-full-thickness: {len(apdl_thickness)} "
+                         f"value(s) given for {len(files)} layer(s).")
+        apdl_thickness = {Path(fp).stem: t
+                          for fp, t in zip(files, apdl_thickness)}
+
     results = process_layers(
         filepaths=files,
         nx=args.nx, ny=args.ny,
@@ -210,6 +226,7 @@ def main():
         y_coords_csv=args.y_coords_csv,
         export_apdl=args.reference_full_model,
         apdl_stride=args.reference_full_stride,
+        apdl_thickness=apdl_thickness,
     )
 
     if args.show:

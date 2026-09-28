@@ -262,6 +262,7 @@ def build_gui(parent):
 
     apdl_var = tk.BooleanVar(value=False)
     apdl_stride_var = tk.StringVar(value="1")
+    apdl_thick_var = tk.StringVar(value="0.035")
     ttk.Checkbutton(opt_frame, text="Export APDL reference-full model",
                     variable=apdl_var).grid(
         row=3, column=0, columnspan=2, padx=6, pady=2, sticky='w')
@@ -270,6 +271,13 @@ def build_gui(parent):
     ttk.Label(af, text="Stride:").pack(side='left')
     ttk.Spinbox(af, from_=1, to=50, textvariable=apdl_stride_var,
                 width=4).pack(side='left', padx=2)
+    tf = tk.Frame(opt_frame)
+    tf.grid(row=3, column=3, padx=6, pady=2, sticky='w')
+    ttk.Label(tf, text="Thickness (mm):").pack(side='left')
+    ttk.Entry(tf, textvariable=apdl_thick_var, width=16).pack(side='left', padx=2)
+    ttk.Label(opt_frame, text="(Thickness: one value for all layers, or comma-separated "
+                              "per layer in file-list order, bottom -> top)").grid(
+        row=5, column=0, columnspan=4, padx=6, pady=(0, 2), sticky='w')
     ttk.Label(opt_frame, text="(one SOLID185 element per raster sub-pixel, MAT=Cu/PPG; "
                               "can be a very large mesh -- raise stride to shrink it)").grid(
         row=4, column=0, columnspan=4, padx=6, pady=(0, 2), sticky='w')
@@ -327,6 +335,14 @@ def build_gui(parent):
         except ValueError:
             messagebox.showerror("Invalid", "APDL stride must be an integer.")
             return
+        try:
+            apdl_thick = [float(v) for v in
+                          apdl_thick_var.get().replace(',', ' ').split()]
+            if not apdl_thick or any(t <= 0 for t in apdl_thick):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid", "APDL thickness must be positive number(s).")
+            return
 
         outdir = outdir_var.get().strip() or None
         excl_n = 0
@@ -362,6 +378,7 @@ def build_gui(parent):
             'cache': cache_var.get(),
             'export_apdl': apdl_var.get(),
             'apdl_stride': apdl_stride,
+            'apdl_thickness': apdl_thick,
         }
         do_plot = plot_var.get()
         do_show = show_var.get()
@@ -376,6 +393,17 @@ def build_gui(parent):
                     log("No Gerber files found in the given paths.\n")
                     return
                 log(f"Found {len(files)} Gerber file(s)\n")
+
+                thick = opts['apdl_thickness']
+                if len(thick) == 1:
+                    thick = thick[0]
+                elif opts['export_apdl']:
+                    if len(thick) != len(files):
+                        log(f"ERROR: {len(thick)} thickness value(s) given for "
+                            f"{len(files)} layer(s).\n")
+                        parent.after(0, lambda: run_btn.config(state='normal'))
+                        return
+                    thick = {Path(fp).stem: t for fp, t in zip(files, thick)}
 
                 results = process_layers(
                     filepaths=files,
@@ -398,6 +426,7 @@ def build_gui(parent):
                     y_coords_csv=y_csv,
                     export_apdl=opts['export_apdl'],
                     apdl_stride=opts['apdl_stride'],
+                    apdl_thickness=thick,
                 )
 
                 log("\n=== Summary ===\n")

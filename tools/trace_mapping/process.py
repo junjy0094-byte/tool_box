@@ -245,7 +245,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
                    x_edges: Optional[np.ndarray] = None,
                    y_edges: Optional[np.ndarray] = None,
                    export_apdl: bool = False,
-                   apdl_stride: int = 1):
+                   apdl_stride: int = 1,
+                   apdl_thickness=0.035):
     """
     Process multiple Gerber layer files.
 
@@ -296,6 +297,9 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
         apdl_stride: Use every Nth raster sub-pixel per axis for the
                reference full model instead of all of them. 1 (default)
                matches the display panel exactly.
+        apdl_thickness: Z thickness (mm) per layer for the reference full
+               model -- one number for all layers, a sequence in layer
+               order, or a {layer_name: thickness} dict.
     Returns:
         dict: {layer_name: TraceGridMapper}
     """
@@ -452,7 +456,8 @@ def process_layers(filepaths: List[str], nx=20, ny=20,
     if export_apdl and results:
         first_fp = next(iter(effective.keys()))
         apdl_dir = Path(outdir) if outdir else Path(first_fp).parent
-        write_reference_full_model_apdl(results, apdl_dir, stride=apdl_stride)
+        write_reference_full_model_apdl(results, apdl_dir, stride=apdl_stride,
+                                        thickness=apdl_thickness)
 
     # --- Step 4: All-layer summary plot ---
     if plot and len(results) > 1:
