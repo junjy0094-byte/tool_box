@@ -270,7 +270,7 @@ def build_gui(parent):
     ttk.Label(af, text="Stride:").pack(side='left')
     ttk.Spinbox(af, from_=1, to=50, textvariable=apdl_stride_var,
                 width=4).pack(side='left', padx=2)
-    ttk.Label(opt_frame, text="(one 2D element per raster sub-pixel, MAT=Cu/PPG; "
+    ttk.Label(opt_frame, text="(one SOLID185 element per raster sub-pixel, MAT=Cu/PPG; "
                               "can be a very large mesh -- raise stride to shrink it)").grid(
         row=4, column=0, columnspan=4, padx=6, pady=(0, 2), sticky='w')
 

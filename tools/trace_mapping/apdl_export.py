@@ -1,6 +1,8 @@
-"""APDL export: the "reference full model" -- a full-resolution FEM mesh
-built directly from a layer's sub-pixel copper raster, one element per
-raster cell, material-assigned Cu vs PPG (prepreg).
+"""APDL export: the "reference full model" -- a full-resolution 3D FEM mesh
+built directly from each layer's sub-pixel copper raster, one SOLID185
+(8-node brick) element per raster cell, material-assigned Cu vs PPG
+(prepreg). Layers are stacked in Z in the order given, each `thickness`
+thick.
 
 This mirrors exactly what the left display panel shows
 (TraceGridMapper._raster_bitmap) -- as opposed to the coarse nx x ny
@@ -12,9 +14,17 @@ A real board can rasterise to millions of cells, so node/element/material
 data is built with vectorised numpy operations (boolean masking + one bulk
 `np.savetxt` write per material group) -- there is no per-element Python
 loop.
+
+Files written (per layer <L>, plus one driver):
+  <L>_node.mac              N commands for that layer (bottom + top plane)
+  <L>_elem.mac              MAT + 8-node E commands for that layer
+  reference_full_model.mac  ET/MP, then /NOPR - /INPUT - /GOPR for every
+                            layer's node and element file, then NUMMRG to
+                            join coincident nodes at layer interfaces.
 """
 
 import numpy as np
+import re
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -40,33 +50,18 @@ PPG_PROPS = {
 }
 
 
-def write_reference_full_model_apdl(mapper, filepath,
-                                    cu_props=None, ppg_props=None,
-                                    elem_type='PLANE182', thickness=0.035,
-                                    stride=1, title='REFERENCE FULL MODEL'):
-    """Write an APDL macro building the mesh exactly as shown in the raster
-    display: one 2D element per raster sub-pixel, MAT=1 (Cu) or MAT=2 (PPG)
-    depending on that pixel's copper/empty state.
+def _safe_name(name):
+    """File stem usable by /INPUT (no spaces, dots or other specials)."""
+    return re.sub(r'[^A-Za-z0-9_]', '_', name)
 
-    Args:
-        mapper: a TraceGridMapper. `.compute()` is called here if the
-                raster bitmap isn't already available.
-        filepath: output .mac path.
-        cu_props / ppg_props: dict of APDL MP labels -> values, overriding
-                the CU_PROPS / PPG_PROPS placeholders above.
-        elem_type: 2D element type. PLANE182 (structural, default) or
-                PLANE55 (thermal) both work -- MP labels irrelevant to the
-                chosen element/analysis type are simply unused, not errors.
-        thickness: shared layer thickness (mm), written as real constant 1
-                (used when elem_type honors KEYOPT(3)=3, plane stress with
-                thickness).
-        stride: use every `stride`-th raster cell per axis instead of all
-                of them, to bound element count for very large boards.
-                1 (default) matches the display panel exactly.
-        title: header comment / model title.
 
-    Returns:
-        dict with node_count, element_count, cu_element_count.
+def _write_layer_files(mapper, out_dir, name, z0, thickness, stride,
+                       node_offset):
+    """Write <name>_node.mac / <name>_elem.mac for one layer.
+
+    Nodes: bottom plane at z0, top plane at z0+thickness, ids starting at
+    node_offset+1. Elements: SOLID185 brick per raster cell, nodes
+    I-J-K-L (bottom, CCW) then M-N-O-P (top, same order).
     """
     if mapper._raster_bitmap is None:
         mapper.compute()
@@ -81,97 +76,145 @@ def write_reference_full_model_apdl(mapper, filepath,
     y_edges = np.linspace(ymin, ymax, ny_s + 1)
     XX, YY = np.meshgrid(x_edges, y_edges)
 
-    node_ids = (np.arange((nx_s + 1) * (ny_s + 1), dtype=np.int64)
-               .reshape(ny_s + 1, nx_s + 1) + 1)
+    n_plane = (nx_s + 1) * (ny_s + 1)
+    bot_ids = (np.arange(n_plane, dtype=np.int64).reshape(ny_s + 1, nx_s + 1)
+               + node_offset + 1)
+    top_ids = bot_ids + n_plane
 
-    # Element corner nodes, vectorised over the whole (ny_s, nx_s) cell
-    # grid at once -- CCW winding (n1 bottom-left -> n4 top-left).
-    n1 = node_ids[:-1, :-1]
-    n2 = node_ids[:-1, 1:]
-    n3 = node_ids[1:, 1:]
-    n4 = node_ids[1:, :-1]
+    # Corner nodes per cell, vectorised over the whole (ny_s, nx_s) grid --
+    # CCW winding seen from +Z (1 bottom-left -> 4 top-left).
+    def corners(ids):
+        return ids[:-1, :-1], ids[:-1, 1:], ids[1:, 1:], ids[1:, :-1]
+    i, j, k, l = corners(bot_ids)
+    m, n, o, p = corners(top_ids)
 
     is_cu = bitmap
-
-    cu = {**CU_PROPS, **(cu_props or {})}
-    ppg = {**PPG_PROPS, **(ppg_props or {})}
-
-    n_nodes = int(node_ids.size)
+    n_nodes = 2 * n_plane
     n_elems = int(nx_s) * int(ny_s)
     n_cu = int(is_cu.sum())
 
-    main_path = Path(filepath)
-    stem = main_path.stem
-    node_name, elem_name = f"{stem}_node", f"{stem}_elem"
-    node_path = main_path.with_name(f"{node_name}.mac")
-    elem_path = main_path.with_name(f"{elem_name}.mac")
+    node_path = Path(out_dir) / f"{name}_node.mac"
+    elem_path = Path(out_dir) / f"{name}_elem.mac"
 
-    # Bulk N,/E, data lives in its own macro so the main file stays readable
-    # and an editor can open it. /NOPR around each /INPUT suppresses the
-    # per-command echo, which is what makes reading millions of lines slow.
     with open(node_path, 'w') as f:
-        f.write(f"! Nodes for {stem} -- {n_nodes} nodes, generated by "
+        f.write(f"! Nodes for layer {name} -- {n_nodes} nodes "
+                f"(z={z0:.6f}..{z0 + thickness:.6f}), generated by "
                 "trace_mapping.apdl_export\n")
-        f.write(f"! Included from {main_path.name}; do not run standalone.\n")
-        node_table = np.column_stack([
-            node_ids.ravel().astype(np.float64), XX.ravel(), YY.ravel(),
-            np.zeros(n_nodes),
-        ])
-        np.savetxt(f, node_table, fmt=['N,%d', '%.6f', '%.6f', '%.6f'], delimiter=',')
+        f.write("! Included from reference_full_model.mac; do not run standalone.\n")
+        for ids, z in ((bot_ids, z0), (top_ids, z0 + thickness)):
+            table = np.column_stack([
+                ids.ravel().astype(np.float64), XX.ravel(), YY.ravel(),
+                np.full(n_plane, z),
+            ])
+            np.savetxt(f, table, fmt=['N,%d', '%.6f', '%.6f', '%.6f'], delimiter=',')
 
     with open(elem_path, 'w') as f:
-        f.write(f"! Elements for {stem} -- {n_elems} elements "
+        f.write(f"! Elements for layer {name} -- {n_elems} SOLID185 elements "
                 f"({n_cu} Cu / {n_elems - n_cu} PPG), generated by "
                 "trace_mapping.apdl_export\n")
-        f.write(f"! Included from {main_path.name}; do not run standalone "
-                "-- ET/MP/R/TYPE/REAL are set there.\n")
+        f.write("! Included from reference_full_model.mac; do not run standalone "
+                "-- ET/MP/TYPE are set there.\n")
         for mat_id, mask, label in ((1, is_cu, 'Cu'), (2, ~is_cu, 'PPG')):
             count = int(mask.sum())
             f.write(f"MAT,{mat_id}   ! {label}: {count} elements\n")
             if count:
-                elems = np.column_stack([n1[mask], n2[mask], n3[mask], n4[mask]]).astype(np.float64)
-                np.savetxt(f, elems, fmt=['E,%d', '%d', '%d', '%d'], delimiter=',')
+                elems = np.column_stack([a[mask] for a in (i, j, k, l, m, n, o, p)])
+                np.savetxt(f, elems, fmt=['E,%d'] + ['%d'] * 7, delimiter=',')
 
+    return {'node_count': n_nodes, 'element_count': n_elems,
+            'cu_element_count': n_cu, 'shape': (nx_s, ny_s),
+            'node_file': str(node_path), 'elem_file': str(elem_path)}
+
+
+def write_reference_full_model_apdl(mappers, out_dir,
+                                    cu_props=None, ppg_props=None,
+                                    elem_type='SOLID185', thickness=0.035,
+                                    stride=1, title='REFERENCE FULL MODEL'):
+    """Write the reference full model as SOLID185 bricks, one per raster
+    sub-pixel, MAT=1 (Cu) or MAT=2 (PPG) by that pixel's copper state.
+
+    Args:
+        mappers: {layer_name: TraceGridMapper}, stacked bottom-up in Z in
+                iteration order. `.compute()` is called if a raster bitmap
+                isn't already available.
+        out_dir: directory for the per-layer node/elem macros and the
+                reference_full_model.mac driver.
+        cu_props / ppg_props: dict of APDL MP labels -> values, overriding
+                the CU_PROPS / PPG_PROPS placeholders above.
+        elem_type: 8-node 3D element type. SOLID185 (structural, default)
+                or SOLID70 (thermal) -- MP labels irrelevant to the chosen
+                element/analysis type are simply unused, not errors.
+        thickness: Z thickness (mm) of each layer.
+        stride: use every `stride`-th raster cell per axis instead of all
+                of them, to bound element count for very large boards.
+                1 (default) matches the display panel exactly.
+        title: header comment / model title.
+
+    Returns:
+        dict with totals and per-layer results under 'layers'.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cu = {**CU_PROPS, **(cu_props or {})}
+    ppg = {**PPG_PROPS, **(ppg_props or {})}
+
+    layers = []
+    node_offset = 0
+    for idx, (name, mapper) in enumerate(mappers.items()):
+        safe = _safe_name(name)
+        info = _write_layer_files(mapper, out_dir, safe, idx * thickness,
+                                  thickness, stride, node_offset)
+        node_offset += info['node_count']
+        info['name'] = safe
+        layers.append(info)
+
+    n_nodes = sum(li['node_count'] for li in layers)
+    n_elems = sum(li['element_count'] for li in layers)
+    n_cu = sum(li['cu_element_count'] for li in layers)
+
+    main_path = out_dir / "reference_full_model.mac"
     with open(main_path, 'w') as f:
         f.write(f"! {title}\n")
         f.write("! Auto-generated by trace_mapping.apdl_export -- reference full model\n")
-        f.write(f"! One element per raster sub-pixel ({nx_s} x {ny_s} = {n_elems} elements),\n")
-        f.write(f"! matching the display panel exactly (stride={stride}).\n")
+        f.write(f"! {elem_type} (8-node brick), one element per raster sub-pixel "
+                f"(stride={stride}),\n")
+        f.write(f"! {len(layers)} layer(s) stacked in +Z, {thickness} mm each.\n")
         f.write("! Placeholder Cu/PPG material properties -- replace before real analysis.\n")
         f.write("! Assumed consistent unit system: mm-ton-s-N-MPa; KXX in W/(mm*K).\n")
-        f.write(f"! Node and element data are in {node_path.name} and "
-                f"{elem_path.name};\n")
-        f.write("! keep all three together and run ANSYS from their directory,\n")
-        f.write("! since /INPUT below resolves them against the working directory.\n")
+        f.write("! Keep this file with the <layer>_node.mac / <layer>_elem.mac files and\n")
+        f.write("! run ANSYS from their directory -- /INPUT resolves against it.\n")
         f.write("/PREP7\n")
         f.write(f"ET,1,{elem_type}\n")
-        f.write("KEYOPT,1,3,3   ! plane stress w/ real-constant thickness (ignored if elem_type doesn't use it)\n")
-        f.write(f"R,1,{thickness}\n")
         for label, value in cu.items():
             f.write(f"MP,{label},1,{value}\n")
         for label, value in ppg.items():
             f.write(f"MP,{label},2,{value}\n")
-        f.write("REAL,1\n")
         f.write("TYPE,1\n")
 
-        f.write(f"! --- Nodes ({n_nodes}) ---\n")
-        f.write("/NOPR\n")
-        f.write(f"/INPUT,{node_name},mac\n")
-        f.write("/GOPR\n")
+        for li in layers:
+            nx_s, ny_s = li['shape']
+            f.write(f"! --- Layer {li['name']}: {li['node_count']} nodes, "
+                    f"{li['element_count']} elements ({nx_s} x {ny_s}) ---\n")
+            f.write("/NOPR\n")
+            f.write(f"/INPUT,{li['name']}_node,mac\n")
+            f.write(f"/INPUT,{li['name']}_elem,mac\n")
+            f.write("/GOPR\n")
 
-        f.write(f"! --- Elements ({n_elems} total, {n_cu} Cu / {n_elems - n_cu} PPG) ---\n")
-        f.write("/NOPR\n")
-        f.write(f"/INPUT,{elem_name},mac\n")
-        f.write("/GOPR\n")
+        if len(layers) > 1:
+            f.write("! Join coincident nodes at layer interfaces\n")
+            f.write("/NOPR\n")
+            f.write("NUMMRG,NODE\n")
+            f.write("/GOPR\n")
 
         f.write("ALLSEL,ALL\n")
 
     print(f"  APDL reference-full-model written: {main_path}")
-    print(f"    + {node_path.name} ({n_nodes} nodes), "
-          f"{elem_path.name} ({n_elems} elements)")
+    for li in layers:
+        print(f"    + {Path(li['node_file']).name} ({li['node_count']} nodes), "
+              f"{Path(li['elem_file']).name} ({li['element_count']} elements)")
     print(f"    nodes={n_nodes}  elements={n_elems}  "
-          f"Cu={n_cu} ({100*n_cu/n_elems:.1f}%)  PPG={n_elems - n_cu}")
+          f"Cu={n_cu} ({100*n_cu/max(n_elems, 1):.1f}%)  PPG={n_elems - n_cu}")
 
     return {'node_count': n_nodes, 'element_count': n_elems,
-            'cu_element_count': n_cu,
-            'node_file': str(node_path), 'elem_file': str(elem_path)}
+            'cu_element_count': n_cu, 'main_file': str(main_path),
+            'layers': layers}
