@@ -51,15 +51,32 @@ def build_gui(parent):
     file_frame = ttk.LabelFrame(parent, text="Gerber Files (.art / .gbr)")
     file_frame.pack(fill='x', padx=8, pady=(8, 4))
 
-    file_listbox = tk.Listbox(file_frame, height=4, selectmode=tk.EXTENDED)
-    file_listbox.pack(side='left', fill='both', expand=True, padx=(4, 0), pady=4)
+    # Row order = APDL Z stacking order (top row = bottom layer).
+    # Single selection only, so dragging a row moves it instead of
+    # extending a selection.
+    file_tree = ttk.Treeview(file_frame, columns=('path', 'thick'),
+                             show='headings', height=4, selectmode='browse')
+    file_tree.heading('path', text="File / Dir  (top row = bottom layer)")
+    file_tree.heading('thick', text="Thickness (mm)")
+    file_tree.column('path', stretch=True, width=400)
+    file_tree.column('thick', stretch=False, width=110, anchor='center')
+    file_tree.pack(side='left', fill='both', expand=True, padx=(4, 0), pady=4)
     file_scroll = ttk.Scrollbar(file_frame, orient='vertical',
-                                command=file_listbox.yview)
+                                command=file_tree.yview)
     file_scroll.pack(side='left', fill='y', pady=4)
-    file_listbox.config(yscrollcommand=file_scroll.set)
+    file_tree.config(yscrollcommand=file_scroll.set)
+
+    def list_paths():
+        return [file_tree.set(i, 'path') for i in file_tree.get_children()]
 
     btn_frame = tk.Frame(file_frame)
     btn_frame.pack(side='left', padx=4, pady=4)
+
+    thick_var = tk.StringVar(value="0.035")
+
+    def add_path(p):
+        if p not in list_paths():
+            file_tree.insert('', tk.END, values=(p, thick_var.get().strip() or "0.035"))
 
     def browse_files():
         paths = filedialog.askopenfilenames(
@@ -67,22 +84,66 @@ def build_gui(parent):
             filetypes=[("Gerber / Artwork", "*.art *.gbr"),
                        ("All files", "*.*")])
         for p in paths:
-            if p not in file_listbox.get(0, tk.END):
-                file_listbox.insert(tk.END, p)
+            add_path(p)
 
     def browse_dir():
         d = filedialog.askdirectory(title="Select directory containing Gerber files")
         if d:
-            if d not in file_listbox.get(0, tk.END):
-                file_listbox.insert(tk.END, d)
+            add_path(d)
 
     def remove_selected():
-        for idx in reversed(file_listbox.curselection()):
-            file_listbox.delete(idx)
+        for iid in file_tree.selection():
+            file_tree.delete(iid)
+
+    def move_selected(delta):
+        for iid in file_tree.selection():
+            idx = file_tree.index(iid) + delta
+            if 0 <= idx < len(file_tree.get_children()):
+                file_tree.move(iid, '', idx)
+                file_tree.see(iid)
+
+    def apply_thickness(_event=None):
+        try:
+            t = float(thick_var.get())
+            if t <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid", "Thickness must be a positive number.")
+            return
+        for iid in file_tree.selection():
+            file_tree.set(iid, 'thick', f"{t:g}")
+
+    def on_select(_event=None):
+        sel = file_tree.selection()
+        if sel:
+            thick_var.set(file_tree.set(sel[0], 'thick'))
+
+    # Drag a row to reorder it.
+    def on_drag(event):
+        sel = file_tree.selection()
+        target = file_tree.identify_row(event.y)
+        if sel and target and target != sel[0]:
+            file_tree.move(sel[0], '', file_tree.index(target))
+
+    file_tree.bind('<<TreeviewSelect>>', on_select)
+    file_tree.bind('<B1-Motion>', on_drag)
 
     ttk.Button(btn_frame, text="Add Files", command=browse_files).pack(fill='x', pady=1)
     ttk.Button(btn_frame, text="Add Dir", command=browse_dir).pack(fill='x', pady=1)
     ttk.Button(btn_frame, text="Remove", command=remove_selected).pack(fill='x', pady=1)
+    mv = tk.Frame(btn_frame)
+    mv.pack(fill='x', pady=1)
+    ttk.Button(mv, text="\u25b2", width=3,
+               command=lambda: move_selected(-1)).pack(side='left', expand=True, fill='x')
+    ttk.Button(mv, text="\u25bc", width=3,
+               command=lambda: move_selected(1)).pack(side='left', expand=True, fill='x')
+    tk_ = tk.Frame(btn_frame)
+    tk_.pack(fill='x', pady=(4, 1))
+    ttk.Label(tk_, text="T (mm):").pack(side='left')
+    te = ttk.Entry(tk_, textvariable=thick_var, width=7)
+    te.pack(side='left', padx=2)
+    te.bind('<Return>', apply_thickness)
+    ttk.Button(btn_frame, text="Set Thickness", command=apply_thickness).pack(fill='x', pady=1)
 
     # ---- Parameters ----
     param_frame = ttk.LabelFrame(parent, text="Grid Parameters")
@@ -262,7 +323,6 @@ def build_gui(parent):
 
     apdl_var = tk.BooleanVar(value=False)
     apdl_stride_var = tk.StringVar(value="1")
-    apdl_thick_var = tk.StringVar(value="0.035")
     ttk.Checkbutton(opt_frame, text="Export APDL reference-full model",
                     variable=apdl_var).grid(
         row=3, column=0, columnspan=2, padx=6, pady=2, sticky='w')
@@ -271,12 +331,8 @@ def build_gui(parent):
     ttk.Label(af, text="Stride:").pack(side='left')
     ttk.Spinbox(af, from_=1, to=50, textvariable=apdl_stride_var,
                 width=4).pack(side='left', padx=2)
-    tf = tk.Frame(opt_frame)
-    tf.grid(row=3, column=3, padx=6, pady=2, sticky='w')
-    ttk.Label(tf, text="Thickness (mm):").pack(side='left')
-    ttk.Entry(tf, textvariable=apdl_thick_var, width=16).pack(side='left', padx=2)
-    ttk.Label(opt_frame, text="(Thickness: one value for all layers, or comma-separated "
-                              "per layer in file-list order, bottom -> top)").grid(
+    ttk.Label(opt_frame, text="(layer thickness & Z stacking order: set per row in "
+                              "the file list above -- top row = bottom layer)").grid(
         row=5, column=0, columnspan=4, padx=6, pady=(0, 2), sticky='w')
     ttk.Label(opt_frame, text="(one SOLID185 element per raster sub-pixel, MAT=Cu/PPG; "
                               "can be a very large mesh -- raise stride to shrink it)").grid(
@@ -309,7 +365,7 @@ def build_gui(parent):
     run_frame.pack(fill='x', padx=8, pady=(0, 8))
 
     def run_processing():
-        paths = list(file_listbox.get(0, tk.END))
+        paths = list_paths()
         if not paths:
             messagebox.showwarning("No files", "Please add at least one Gerber file.")
             return
@@ -336,12 +392,12 @@ def build_gui(parent):
             messagebox.showerror("Invalid", "APDL stride must be an integer.")
             return
         try:
-            apdl_thick = [float(v) for v in
-                          apdl_thick_var.get().replace(',', ' ').split()]
-            if not apdl_thick or any(t <= 0 for t in apdl_thick):
+            apdl_thick = [float(file_tree.set(i, 'thick'))
+                          for i in file_tree.get_children()]
+            if any(t <= 0 for t in apdl_thick):
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Invalid", "APDL thickness must be positive number(s).")
+            messagebox.showerror("Invalid", "Layer thickness must be positive numbers.")
             return
 
         outdir = outdir_var.get().strip() or None
@@ -394,16 +450,12 @@ def build_gui(parent):
                     return
                 log(f"Found {len(files)} Gerber file(s)\n")
 
-                thick = opts['apdl_thickness']
-                if len(thick) == 1:
-                    thick = thick[0]
-                elif opts['export_apdl']:
-                    if len(thick) != len(files):
-                        log(f"ERROR: {len(thick)} thickness value(s) given for "
-                            f"{len(files)} layer(s).\n")
-                        parent.after(0, lambda: run_btn.config(state='normal'))
-                        return
-                    thick = {Path(fp).stem: t for fp, t in zip(files, thick)}
+                # Per-layer thickness from each list row; a Dir row's
+                # thickness applies to every file found in it.
+                thick = {}
+                for p, t in zip(paths, opts['apdl_thickness']):
+                    for fp in collect_art_files([p]):
+                        thick[Path(fp).stem] = t
 
                 results = process_layers(
                     filepaths=files,
@@ -486,7 +538,7 @@ def build_gui(parent):
         meta + raster caches exist. On any cache miss, a messagebox
         instructs the user to run once first.
         """
-        paths = list(file_listbox.get(0, tk.END))
+        paths = list_paths()
         if not paths:
             messagebox.showwarning("No files", "Please add at least one Gerber file.")
             return
@@ -575,7 +627,7 @@ def build_gui(parent):
         """Delete .trace_cache directories next to the listed art files."""
         import shutil
         roots = set()
-        for p in file_listbox.get(0, tk.END):
+        for p in list_paths():
             pp = Path(p)
             roots.add(pp if pp.is_dir() else pp.parent)
         removed = 0
